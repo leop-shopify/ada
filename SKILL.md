@@ -1,0 +1,178 @@
+# ADA -- Artifact Driven Agent
+
+ADA gives you a persistent, structured workspace for any multi-step work. The artifact
+is a living JSON document you enrich every iteration -- a database for the task at hand.
+It survives across turns, sessions, and agent boundaries.
+
+## When to create an artifact
+
+Any work that iterates: performance investigations, bug fixes, code reviews, planning
+sessions, peer reviews, research projects. If you will make more than 3 tool calls
+to get the job done, create an artifact.
+
+## Core concept
+
+The artifact has two parts:
+
+**data** -- a free-form JSON object you own completely. Structure it however the work
+demands. Nested objects, arrays, measurements, people, questions, files -- anything.
+This is the substance. You read it, update it, query specific keys, and build on it
+every iteration.
+
+**checkpoints** -- milestones that mark meaningful progress. Not a journal. Not every
+action. Just the moments that matter: "baseline measured", "root cause found",
+"3/8 interviews complete".
+
+## Tools
+
+`ada_create` -- Start a new artifact. Give it a title and type.
+
+`ada_update` -- Write key-value pairs into data. Shallow merge at the top level.
+For nested updates, use `ada_get` to read the current value, modify it, then write
+the whole key back with `ada_update`.
+
+`ada_get` -- Targeted read. Pass specific keys to get just those. Pass no keys to
+get the header (title, type, status, available keys, checkpoints) without loading data.
+Use this for normal work -- it keeps context lean. Spawned agents can pass an `id`
+parameter to connect to an artifact they were told about by the lead.
+
+`ada_read` -- Full load. Returns everything. Use when resuming from another session
+or when you genuinely need the complete picture. Expensive on context.
+
+`ada_checkpoint` -- Mark a milestone. One sentence about what was reached.
+
+`ada_close` -- Completed (done forever) or paused (resume later).
+
+## The artifact folder
+
+Each artifact lives in its own folder:
+
+    ~/.pi/agent/artifacts/{slug}/artifact.json
+
+You can write any file into this folder using the standard `write` tool. Reference
+documents, research notes, interview transcripts, evidence files, exported data --
+anything that supports the work belongs here. The folder is the artifact's workspace.
+
+Example: for a peer review cycle, you might have:
+- artifact.json (the structured data -- people, questions, responses, status)
+- alice-evidence.md (gathered PR evidence for Alice's review)
+- self-review-draft.md (working draft of the self-review)
+- interview-questions.md (template questions used across all interviews)
+
+The artifact's data object can reference these files by name. The agent or a spawned
+agent can read them with the standard `read` tool. Everything stays together.
+
+## Spawning agents with artifacts
+
+When you spawn an agent to do work for an active artifact, include the artifact ID
+and folder path in the task prompt. The spawned agent has full access to ADA tools.
+
+Example task prompt for the lead to use:
+
+    "Research Alice's recent PRs and code activity for the peer review.
+    Write your findings into the active artifact using ada_update.
+    Artifact ID: q1-2026-peer-review-cycle
+    Artifact folder: ~/.pi/agent/artifacts/q1-2026-peer-review-cycle/
+    Use ada_get to check current state before writing.
+    Save any long-form evidence as files in the artifact folder.
+    Send a team_message when done with a one-line summary."
+
+The spawned agent:
+1. Calls `ada_get` with `id` parameter to connect to the artifact
+2. Calls `ada_get` with specific keys to check current state
+3. Does its research
+4. Calls `ada_update` to write structured findings into data
+5. Uses `write` to save reference files in the artifact folder if needed
+6. Sends `team_message` with a brief summary when done
+
+The lead does NOT need to read /tmp files, copy data, or funnel results. The spawned
+agent writes directly into the shared workspace. The lead calls `ada_get` to see
+what the agent added.
+
+Do NOT tell spawned agents to save results to /tmp when an artifact is active. The
+artifact folder is the workspace. /tmp is for throwaway data with no artifact context.
+
+## Context management
+
+The prompt injection is minimal: just the artifact title and ID. No data is loaded
+into context automatically. You control what enters context by calling `ada_get`
+with specific keys. This means:
+
+- A massive artifact with 50 data keys does not bloat your context
+- You load only what you need for the current step
+- Use `ada_get` (no keys) to orient: see what keys exist, read checkpoints
+- Use `ada_get` (specific keys) to load the data you need right now
+- Use `ada_read` only when resuming or when you need everything
+
+## Concurrent access
+
+Multiple agents can write to the same artifact. Writes are locked -- if two agents
+call `ada_update` at the same time, one waits for the other to finish. Data is
+re-read from disk before every write so no changes are lost.
+
+## How to structure data
+
+There is no forced schema. Structure data for the work:
+
+Performance investigation:
+```json
+{
+  "endpoint": "/api/orders",
+  "baseline": { "p50_ms": 120, "p99_ms": 450, "sample": 1000 },
+  "attempts": [
+    { "change": "index on user_id", "p50_ms": 85, "p99_ms": 210 },
+    { "change": "eager load line_items", "p50_ms": 72, "p99_ms": 180 }
+  ],
+  "root_cause": "missing index + N+1 on line_items",
+  "files_changed": ["order.rb", "migration.rb"]
+}
+```
+
+Peer review cycle:
+```json
+{
+  "cycle": { "name": "Q2 2026", "start": "2026-04-06", "end": "2026-05-06" },
+  "self_review": { "status": "done", "review_id": 12345 },
+  "interviews": {
+    "alice": { "status": "done", "questions_done": 5, "evidence_file": "alice-evidence.md" },
+    "bob": { "status": "paused", "paused_at": "Q3", "questions_done": 2 },
+    "charlie": { "status": "new" }
+  }
+}
+```
+
+Bug investigation:
+```json
+{
+  "symptom": "500 errors on /checkout after deploy",
+  "hypothesis": "null user_id in new migration path",
+  "evidence": { "error_count": 1200, "first_seen": "14:32 UTC", "trace_id": "abc123" },
+  "root_cause": null,
+  "files_investigated": ["checkout_controller.rb", "account.rb"],
+  "files_to_fix": []
+}
+```
+
+## Resuming across sessions
+
+When you start a new session and need to continue previous work:
+
+1. Use `/ada-resume {id}` to connect to the artifact
+2. Call `ada_read` to load the full picture and orient
+3. From there, use `ada_get` for targeted reads as you work
+
+The artifact keeps its data and checkpoints across sessions. The resume command
+rebinds session ownership so only your session auto-loads it going forward.
+
+## What NOT to do
+
+- Do not use the artifact as a journal. "I looked at file X" is not useful data.
+  Store what you found, not what you did.
+- Do not dump entire file contents into data keys. Reference files by path instead
+  and store them in the artifact folder.
+- Do not load the full artifact every turn. Use ada_get for targeted reads.
+- Do not create an artifact for simple one-shot tasks. It is for iterative work.
+- Do not store transient state that changes every turn. Data should accumulate and
+  enrich, not churn.
+- Do not tell spawned agents to save to /tmp when an artifact is active. The artifact
+  folder is the workspace.
