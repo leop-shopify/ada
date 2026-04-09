@@ -4,6 +4,9 @@ ADA gives you a persistent, structured workspace for any multi-step work. The ar
 is a living JSON document you enrich every iteration -- a database for the task at hand.
 It survives across turns, sessions, and agent boundaries.
 
+Artifacts are shared. Any session can resume any artifact. There is no session binding,
+no lifecycle status, no closing. One artifact at a time. Use /ada-resume to switch.
+
 ## When to create an artifact
 
 Any work that iterates: performance investigations, bug fixes, code reviews, planning
@@ -25,14 +28,15 @@ action. Just the moments that matter: "baseline measured", "root cause found",
 
 ## Tools
 
-`ada_create` -- Start a new artifact. Give it a title and type.
+`ada_create` -- Start a new artifact. Only works when no artifact is currently active.
+If one exists, the tool blocks. Use /ada-resume to switch artifacts.
 
 `ada_update` -- Write key-value pairs into data. Shallow merge at the top level.
 For nested updates, use `ada_get` to read the current value, modify it, then write
 the whole key back with `ada_update`.
 
 `ada_get` -- Targeted read. Pass specific keys to get just those. Pass no keys to
-get the header (title, type, status, available keys, checkpoints) without loading data.
+get the header (title, type, available keys, checkpoints) without loading data.
 Use this for normal work -- it keeps context lean. Spawned agents can pass an `id`
 parameter to connect to an artifact they were told about by the lead.
 
@@ -41,7 +45,7 @@ or when you genuinely need the complete picture. Expensive on context.
 
 `ada_checkpoint` -- Mark a milestone. One sentence about what was reached.
 
-`ada_close` -- Completed (done forever) or paused (resume later).
+There is no ada_close. Artifacts do not close. To switch, use /ada-resume.
 
 ## The artifact folder
 
@@ -65,7 +69,7 @@ agent can read them with the standard `read` tool. Everything stays together.
 ## Spawning agents with artifacts
 
 When you spawn an agent to do work for an active artifact, include the artifact ID
-and folder path in the task prompt. The spawned agent has full access to ADA tools.
+and folder path in the task prompt. The spawned agent can read and update the artifact.
 
 Example task prompt for the lead to use:
 
@@ -84,6 +88,22 @@ The spawned agent:
 4. Calls `ada_update` to write structured findings into data
 5. Uses `write` to save reference files in the artifact folder if needed
 6. Sends `team_message` with a brief summary when done
+
+## Spawned agent guardrails (enforced in code)
+
+Spawned agents have hard restrictions. These are enforced at TWO levels -- the tool
+is not even registered for spawned agents (invisible), AND the execute function has
+a belt-and-suspenders BLOCKED guard. No way to game it:
+
+- `ada_create` -- NOT REGISTERED for spawned agents. The tool does not exist in
+  their runtime. Even if somehow called, the execute guard blocks it. Spawned agents
+  MUST use `ada_get` with the artifact ID from their task prompt to connect.
+
+Spawned agents CAN use:
+- `ada_get` -- to connect (with id) and read data
+- `ada_update` -- to write findings into the shared artifact
+- `ada_checkpoint` -- to mark progress milestones
+- `ada_read` -- to load the full artifact when needed
 
 The lead does NOT need to read /tmp files, copy data, or funnel results. The spawned
 agent writes directly into the shared workspace. The lead calls `ada_get` to see
@@ -155,14 +175,43 @@ Bug investigation:
 
 ## Resuming across sessions
 
-When you start a new session and need to continue previous work:
+Artifacts are shared across sessions. Any session can resume any artifact:
 
-1. Use `/ada-resume {id}` to connect to the artifact
+1. Use `/ada-resume` to pick an artifact (interactive) or `/ada-resume {id}` for a specific one
 2. Call `ada_read` to load the full picture and orient
 3. From there, use `ada_get` for targeted reads as you work
 
-The artifact keeps its data and checkpoints across sessions. The resume command
-rebinds session ownership so only your session auto-loads it going forward.
+If an artifact is already active when you resume, the current one is detached and the
+new one becomes active. No closing needed.
+
+## Artifacts are long-lived project trackers
+
+An artifact tracks a PROJECT, not a single task within the project. When a project
+has multiple issues, phases, or sub-tasks, they ALL belong in ONE artifact. Do not
+create a new artifact for each sub-task.
+
+Examples of WRONG behavior:
+- Creating a new artifact when one already exists for the project
+- Creating separate artifacts for each sub-issue of a parent issue
+
+## Duplicate prevention (enforced in code)
+
+The system has hard guards against duplicate artifacts. These are NOT advisory --
+the tool will reject the call with a BLOCKED error:
+
+1. **Exact slug collision**: If you try to create "PR Review Triage" and an artifact
+   with slug `pr-review-triage` already exists, BLOCKED. Use /ada-resume instead.
+
+2. **Similar title detection**: If you try to create "PR Review Triage - Apr 8" and
+   an artifact called "PR Review Triage" exists, BLOCKED. The system compares
+   normalized titles (stripping dates, noise words, punctuation) and blocks at
+   50% Jaccard similarity or higher.
+
+3. **Spawned agent creation**: Spawned agents cannot create artifacts. The tool is
+   not even registered in their runtime.
+
+If you get BLOCKED, the error message tells you which existing artifact to resume.
+Use /ada-resume <id> to switch to it.
 
 ## What NOT to do
 
@@ -176,3 +225,7 @@ rebinds session ownership so only your session auto-loads it going forward.
   enrich, not churn.
 - Do not tell spawned agents to save to /tmp when an artifact is active. The artifact
   folder is the workspace.
+- Do not create a new artifact to amend an existing one. Update the original.
+- Do not create "Issue 4691 Investigation" today and "Issue 4691 Investigation v2"
+  tomorrow. Resume the original.
+- Do not add dates to artifact titles. "PR Review Triage" not "PR Review Triage - Apr 8".

@@ -6,9 +6,9 @@
  * bug fixes, code reviews, planning — it creates an artifact that serves as
  * the source of truth for the entire conversation.
  *
- * CRITICAL INVARIANT: Artifacts NEVER leak across sessions. Every path that
- * loads an artifact into state checks session_id against the current session.
- * The only way to load another session's artifact is explicit /artifact resume.
+ * Artifacts are shared across sessions. Any session can resume any artifact
+ * via /ada-resume. There is no session binding or lifecycle status.
+ * Spawned agents can only read/update — never create.
  *
  * Files:
  *   index.ts   — state, event handlers, wiring
@@ -43,12 +43,9 @@ const SUBSTANTIVE_TOOLS = new Set([
 const NUDGE_THRESHOLD = 4;
 
 export default function adaExtension(pi: ExtensionAPI): void {
-	// ─── Session vs Spawned Agent ───────────────────────────────────
-	// Spawned agents (team_spawn) are part of the SAME session -- they get
-	// full artifact access (tools + reads + writes). They are teammates.
-	// Different Pi sessions are what session binding prevents.
-	// Spawned agents skip prompt injection only (they get the artifact ID
-	// in their task prompt from the lead, not via auto-injection).
+	// ─── Spawned Agent Detection ───────────────────────────────────
+	// Spawned agents can only read/update artifacts. Never create.
+	// They get the artifact ID in their task prompt from the lead.
 	const isSpawnedAgent = process.env.PI_AGENT_ROLE === "subagent" ||
 		process.env.PI_TEAM_NAME !== undefined;
 
@@ -56,28 +53,7 @@ export default function adaExtension(pi: ExtensionAPI): void {
 		artifact: null,
 		artifactUpdatedThisTurn: false,
 		toolCallsThisTurn: 0,
-		sessionId: null,
 	};
-
-	// ─── Session-Guarded Artifact Loading ───────────────────────────
-	// This is the ONLY function that may set state.artifact from disk.
-	// It enforces session_id matching. No exceptions.
-
-	function loadArtifactIfOwned(id: string): Artifact | null {
-		const artifact = readArtifactFromDisk(id);
-		if (!artifact) return null;
-		// Spawned agents are trusted teammates -- they skip session binding.
-		// They are told which artifact to use by the lead in their task prompt.
-		if (isSpawnedAgent) return artifact;
-		// Session binding: only load if this session owns it.
-		// Reject if we don't know our own session yet, or if the artifact
-		// belongs to a different session.
-		if (!state.sessionId) return null;
-		if (artifact.session_id && artifact.session_id !== state.sessionId) {
-			return null;
-		}
-		return artifact;
-	}
 
 	// ─── State Restoration ──────────────────────────────────────────
 
@@ -85,14 +61,13 @@ export default function adaExtension(pi: ExtensionAPI): void {
 		state.artifact = null;
 		state.artifactUpdatedThisTurn = false;
 		state.toolCallsThisTurn = 0;
-		state.sessionId = ctx.sessionManager.getSessionFile() ?? null;
 
-		// Restore ONLY from session branch. No disk fallback. Ever.
+		// Restore from session branch. Artifacts are shared — no session binding.
 		for (const entry of ctx.sessionManager.getBranch()) {
 			if (entry.type === "custom" && entry.customType === "ada-artifact") {
-				const data = entry.data as { artifact?: { id: string; status: string } } | undefined;
+				const data = entry.data as { artifact?: { id: string } } | undefined;
 				if (data?.artifact) {
-					state.artifact = loadArtifactIfOwned(data.artifact.id);
+					state.artifact = readArtifactFromDisk(data.artifact.id);
 				} else {
 					state.artifact = null;
 				}
@@ -105,23 +80,11 @@ export default function adaExtension(pi: ExtensionAPI): void {
 				entry.message.details?.artifact
 			) {
 				const a = entry.message.details.artifact as Artifact;
-				state.artifact = loadArtifactIfOwned(a.id);
-			}
-
-			if (
-				entry.type === "message" &&
-				entry.message.role === "toolResult" &&
-				entry.message.toolName === "ada_close" &&
-				entry.message.details?.artifact
-			) {
-				const a = entry.message.details.artifact as Artifact;
-				if (a.status === "completed") {
-					state.artifact = null;
-				}
+				state.artifact = readArtifactFromDisk(a.id);
 			}
 		}
 
-		// Auto-cleanup old completed artifacts on session start
+		// Auto-cleanup old artifacts on session start
 		cleanupOldArtifacts(7);
 	}
 
@@ -136,17 +99,38 @@ export default function adaExtension(pi: ExtensionAPI): void {
 
 	pi.on("before_agent_start", async () => {
 		if (isSpawnedAgent) return; // Spawned agents get tools, not prompt injection
-		if (!state.artifact || state.artifact.status !== "active") return;
+		if (!state.artifact) return;
+
+		// Re-read from disk to get the latest keys (another agent may have written)
+		const fresh = readArtifactFromDisk(state.artifact.id);
+		if (fresh) {
+			state.artifact.data = fresh.data;
+			state.artifact.checkpoints = fresh.checkpoints;
+		}
 
 		const a = state.artifact;
+		const dataKeys = Object.keys(a.data);
+		const cpCount = a.checkpoints.length;
+		const lastCp = cpCount > 0 ? a.checkpoints[cpCount - 1].note : null;
+
+		// Build a concise context block so the agent never has to guess key names.
+		// This eliminates the common pattern of ada_get with wrong keys -> header -> correct key.
+		let keysLine = "";
+		if (dataKeys.length > 0) {
+			keysLine = `\nData keys (${dataKeys.length}): ${dataKeys.join(", ")}`;
+		}
+		let cpLine = "";
+		if (lastCp) {
+			cpLine = `\nLast checkpoint (#${cpCount}): ${lastCp}`;
+		}
 
 		return {
 			systemPrompt: undefined,
 			message: {
 				customType: "ada-context",
 				content: `[BACKGROUND STATE -- not the conversation topic]
-Active artifact: "${a.title}" (${a.type}) -- ${a.id}
-Use ada_get to load specific data when needed.`,
+Active artifact: "${a.title}" (${a.type}) -- ${a.id}${keysLine}${cpLine}
+Use ada_get with specific key names above to load data when needed.`,
 				display: false,
 			},
 		};
@@ -163,8 +147,7 @@ Use ada_get to load specific data when needed.`,
 		if (
 			event.toolName === "ada_create" ||
 			event.toolName === "ada_update" ||
-			event.toolName === "ada_checkpoint" ||
-			event.toolName === "ada_close"
+			event.toolName === "ada_checkpoint"
 		) {
 			state.artifactUpdatedThisTurn = true;
 		} else if (SUBSTANTIVE_TOOLS.has(event.toolName)) {
@@ -173,7 +156,7 @@ Use ada_get to load specific data when needed.`,
 	});
 
 	pi.on("agent_end", async () => {
-		if (!state.artifact || state.artifact.status !== "active") return;
+		if (!state.artifact) return;
 		if (state.artifactUpdatedThisTurn) return;
 		if (state.toolCallsThisTurn < NUDGE_THRESHOLD) return;
 
@@ -221,14 +204,14 @@ Use ada_get to load specific data when needed.`,
 				ctx.ui.notify("No artifacts found.", "info");
 				return;
 			}
+			const currentId = state.artifact?.id;
 			const lines = all.map((a) => {
-				const statusLabel = a.status === "active" ? "[active]" : a.status === "paused" ? "[paused]" : "[done]";
-				const owned = a.session_id === state.sessionId ? "" : " [other session]";
+				const active = a.id === currentId ? " [current]" : "";
 				const age = timeSince(new Date(a.updated_at));
 				const dataKeys = Object.keys(a.data ?? {});
 				const cpCount = (a.checkpoints ?? []).length;
 				const lastCp = cpCount > 0 ? a.checkpoints[cpCount - 1].note.slice(0, 60) : "";
-				return `${statusLabel} ${a.title} (${a.type}) -- ${dataKeys.length} keys, ${cpCount} cp -- ${age} ago${owned}\n  ${lastCp ? `last: ${lastCp}\n  ` : ""}id: ${a.id}`;
+				return `${a.title} (${a.type}) -- ${dataKeys.length} keys, ${cpCount} cp -- ${age} ago${active}\n  ${lastCp ? `last: ${lastCp}\n  ` : ""}id: ${a.id}`;
 			});
 			ctx.ui.notify(lines.join("\n\n"), "info");
 		},
@@ -242,19 +225,18 @@ Use ada_get to load specific data when needed.`,
 			// No ID provided -- show interactive picker
 			if (!id) {
 				const all = listArtifactsFromDisk();
-				const resumable = all.filter((a) => a.status !== "active" || a.session_id !== state.sessionId);
+				const currentId = state.artifact?.id;
+				const resumable = all.filter((a) => a.id !== currentId);
 				if (resumable.length === 0) {
-					ctx.ui.notify("No artifacts to resume.", "info");
+					ctx.ui.notify("No other artifacts to resume.", "info");
 					return;
 				}
 				const options = resumable.map((a) => {
-					const label = a.status === "paused" ? "[paused]" : a.status === "completed" ? "[done]" : "[active]";
 					const age = timeSince(new Date(a.updated_at));
-					return `${label} ${a.title} (${Object.keys(a.data ?? {}).length} keys, ${age} ago) -- ${a.id}`;
+					return `${a.title} (${Object.keys(a.data ?? {}).length} keys, ${age} ago) -- ${a.id}`;
 				});
 				const choice = await ctx.ui.select("Resume artifact:", options);
 				if (!choice) return;
-				// Extract ID from the end of the selected line
 				const match = choice.match(/-- (.+)$/);
 				if (!match) return;
 				id = match[1];
@@ -265,17 +247,43 @@ Use ada_get to load specific data when needed.`,
 				ctx.ui.notify(`Artifact not found: ${id}`, "error");
 				return;
 			}
-			if (state.artifact?.status === "active") {
-				ctx.ui.notify(`Close the current artifact first: "${state.artifact.title}"`, "warn");
-				return;
+
+			// Detach current artifact if one exists, then switch
+			if (state.artifact) {
+				state.artifact.updated_at = new Date().toISOString();
+				writeArtifactToDisk(state.artifact);
 			}
-			artifact.status = "active";
-			artifact.session_id = state.sessionId;
+
 			artifact.updated_at = new Date().toISOString();
 			state.artifact = artifact;
 			writeArtifactToDisk(artifact);
 			persistState(pi, state);
-			ctx.ui.notify(`Resumed: "${artifact.title}" (${Object.keys(artifact.data ?? {}).length} keys, ${(artifact.checkpoints ?? []).length} checkpoints)`, "info");
+
+			const dataKeys = Object.keys(artifact.data ?? {});
+			const cpCount = (artifact.checkpoints ?? []).length;
+			ctx.ui.notify(`Resumed: "${artifact.title}" (${dataKeys.length} keys, ${cpCount} checkpoints)`, "info");
+
+			// Inject a context message with the keys so the agent knows what data
+			// is available without having to call ada_get(header) first.
+			const lastCp = cpCount > 0 ? artifact.checkpoints[cpCount - 1].note : null;
+			let keysLine = "";
+			if (dataKeys.length > 0) {
+				keysLine = `\nData keys (${dataKeys.length}): ${dataKeys.join(", ")}`;
+			}
+			let cpLine = "";
+			if (lastCp) {
+				cpLine = `\nLast checkpoint (#${cpCount}): ${lastCp}`;
+			}
+			pi.sendMessage(
+				{
+					customType: "ada-context",
+					content: `[BACKGROUND STATE -- not the conversation topic]
+Resumed artifact: "${artifact.title}" (${artifact.type}) -- ${artifact.id}${keysLine}${cpLine}
+Use ada_get with specific key names above to load data when needed.`,
+					display: false,
+				},
+				{ triggerTurn: false },
+			);
 		},
 	});
 
@@ -286,7 +294,7 @@ Use ada_get to load specific data when needed.`,
 
 	pi.on("tool_call", async (event) => {
 		if (event.toolName !== "team_spawn") return;
-		if (!state.artifact || state.artifact.status !== "active") return;
+		if (!state.artifact) return;
 		if (isSpawnedAgent) return; // only leads inject
 
 		const input = event.input as { task?: string };
@@ -294,14 +302,19 @@ Use ada_get to load specific data when needed.`,
 
 		const artifactId = state.artifact.id;
 		const dir = `${ARTIFACTS_DIR}/${artifactId}`;
+		const dataKeys = Object.keys(state.artifact.data);
+		const keysInfo = dataKeys.length > 0
+			? `\nAvailable data keys: ${dataKeys.join(", ")}`
+			: "";
 		input.task += `\n\nActive ADA artifact: ${artifactId}\n` +
 			`Artifact folder: ${dir}/\n` +
-			`Use ada_get with id="${artifactId}" to connect, then ada_update to write findings.`;
+			`Use ada_get with id="${artifactId}" to connect, then ada_update to write findings.` +
+			keysInfo;
 	});
 
 	// ─── Register Tools ─────────────────────────────────────────────
 
-	registerTools(pi, state, loadArtifactIfOwned);
+	registerTools(pi, state, isSpawnedAgent);
 }
 
 // ─── Utility ──────────────────────────────────────────────────────────

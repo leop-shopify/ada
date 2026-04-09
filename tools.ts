@@ -1,5 +1,5 @@
 /**
- * ADA Tools — ada_create, ada_update, ada_read, ada_close
+ * ADA Tools — ada_create, ada_update, ada_get, ada_checkpoint, ada_read
  *
  * ada_update writes key-value pairs into the artifact's data object.
  * The agent structures data however the work demands — no forced schema.
@@ -11,20 +11,25 @@ import { Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import {
 	writeArtifactToDisk, readArtifactFromDisk, persistState, slugify, artifactDir,
-	acquireLock, releaseLock,
+	acquireLock, releaseLock, findSimilarArtifacts, listArtifactsFromDisk,
 } from "./helpers.js";
-import type { ADAState, Artifact, ArtifactStatus, ArtifactType, Checkpoint } from "./types.js";
+import type { ADAState, Artifact, ArtifactType, Checkpoint } from "./types.js";
 import { ARTIFACTS_DIR } from "./types.js";
 
 export function registerTools(
 	pi: ExtensionAPI,
 	state: ADAState,
-	loadArtifactIfOwned: (id: string) => Artifact | null,
+	isSpawnedAgent: boolean,
 ): void {
 
 	// ─── ada_create ───────────────────────────────────────────────
+	// Spawned agents don't even SEE this tool. The tool is simply not
+	// registered, so it cannot appear in their tool list or be called.
+	// Defense in depth: even if env detection has a gap, the tool
+	// won't exist in their runtime. The execute() guard remains as
+	// a belt-and-suspenders safety net.
 
-	pi.registerTool({
+	if (!isSpawnedAgent) pi.registerTool({
 		name: "ada_create",
 		label: "Create Artifact",
 		description:
@@ -34,8 +39,9 @@ export function registerTools(
 		promptSnippet: "Create an ADA artifact to track multi-step or iterative work",
 		promptGuidelines: [
 			"Create an artifact when work involves iteration, tracking, or multiple steps — performance investigations, bug fixes, code reviews, planning, anything non-trivial.",
-			"Always create an artifact before starting multi-step work. Update it as you go. Close it when done.",
-			"One artifact at a time. Close or pause the current one before creating a new one.",
+			"Always create an artifact before starting multi-step work. Update it as you go.",
+			"One artifact at a time. Creating a new one detaches the previous.",
+			"NEVER create a duplicate artifact. If one already exists for the same work, use /ada-resume to switch to it. The tool will block you if a similar artifact exists.",
 		],
 		parameters: Type.Object({
 			title: Type.String({ description: "Short descriptive title for the work being tracked" }),
@@ -50,27 +56,75 @@ export function registerTools(
 		}),
 
 		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-			if (state.artifact && state.artifact.status === "active") {
+			// Hard guardrail: spawned agents must NEVER create artifacts.
+			if (isSpawnedAgent) {
 				return {
 					content: [{
 						type: "text" as const,
-						text: `An artifact is already active: "${state.artifact.title}" (${state.artifact.id}). Close or pause it first with ada_close.`,
+						text: "BLOCKED: Spawned agents cannot create artifacts. " +
+							"Use ada_get with the artifact ID from your task prompt to connect to the lead's artifact. " +
+							"Then use ada_update and ada_checkpoint to write your findings.",
 					}],
 					details: {},
 				};
 			}
 
-			const now = new Date();
+			// Block if an artifact is already active. Use /ada-resume to switch.
+			if (state.artifact) {
+				return {
+					content: [{
+						type: "text" as const,
+						text: `An artifact is already active: "${state.artifact.title}" (${state.artifact.id}). ` +
+							`Use /ada-resume to switch artifacts. Do NOT try to close and recreate.`,
+					}],
+					details: {},
+				};
+			}
+
 			const slug = slugify(params.title);
 			const { existsSync } = await import("node:fs");
-			const id = existsSync(artifactDir(slug)) ? `${slug}-${now.getTime()}` : slug;
+
+			// ── Guard 1: Exact slug collision ──
+			// NEVER create a timestamp-suffixed duplicate. If the slug exists, the
+			// artifact already exists. The agent must resume it instead.
+			if (existsSync(artifactDir(slug))) {
+				const existing = readArtifactFromDisk(slug);
+				const existingTitle = existing?.title ?? slug;
+				return {
+					content: [{
+						type: "text" as const,
+						text: `BLOCKED: An artifact with this slug already exists: "${existingTitle}" (${slug}).\n` +
+							`Use /ada-resume ${slug} to switch to it. Do NOT create a duplicate.`,
+					}],
+					details: { blocked_reason: "exact_slug_collision", existing_id: slug },
+				};
+			}
+
+			// ── Guard 2: Similar title detection ──
+			// Catch near-duplicates like "PR Review Triage" vs "PR Review Triage - Apr 8"
+			const similar = findSimilarArtifacts(params.title);
+			if (similar.length > 0) {
+				const matches = similar
+					.slice(0, 3)
+					.map((s) => `  - "${s.artifact.title}" (${s.artifact.id}) [${Math.round(s.similarity * 100)}% similar]`)
+					.join("\n");
+				return {
+					content: [{
+						type: "text" as const,
+						text: `BLOCKED: Similar artifact(s) already exist:\n${matches}\n\n` +
+							`Use /ada-resume <id> to switch to an existing artifact instead of creating a duplicate. ` +
+							`Only create a new artifact if the work is genuinely unrelated to all of the above.`,
+					}],
+					details: { blocked_reason: "similar_title", similar: similar.map((s) => s.artifact.id) },
+				};
+			}
+
+			const now = new Date();
 			const artifact: Artifact = {
-				id,
+				id: slug,
 				title: params.title,
 				description: params.description,
 				type: (params.type as ArtifactType) ?? "general",
-				status: "active",
-				session_id: state.sessionId,
 				created_at: now.toISOString(),
 				updated_at: now.toISOString(),
 				data: {},
@@ -140,9 +194,9 @@ export function registerTools(
 		}),
 
 		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-			if (!state.artifact || state.artifact.status !== "active") {
+			if (!state.artifact) {
 				return {
-					content: [{ type: "text" as const, text: "No active artifact. Create one first with ada_create." }],
+					content: [{ type: "text" as const, text: "No active artifact. Create one with ada_create, or use ada_get with an artifact id to connect." }],
 					details: {},
 				};
 			}
@@ -224,9 +278,9 @@ export function registerTools(
 		}),
 
 		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-			if (!state.artifact || state.artifact.status !== "active") {
+			if (!state.artifact) {
 				return {
-					content: [{ type: "text" as const, text: "No active artifact." }],
+					content: [{ type: "text" as const, text: "No active artifact. Use ada_get with an artifact id to connect, or ada_create to start a new one." }],
 					details: {},
 				};
 			}
@@ -292,7 +346,7 @@ export function registerTools(
 		description:
 			"Read specific keys from the active artifact's data. Returns only the requested data, " +
 			"not the full artifact. Use this to load what you need without pulling everything into context.\n\n" +
-			"Pass no keys to get the artifact header (title, type, status, data keys list, checkpoints) " +
+			"Pass no keys to get the artifact header (title, type, data keys list, checkpoints) " +
 			"without the data itself -- useful to orient before diving in.",
 		promptSnippet: "Read specific keys from the active artifact",
 		parameters: Type.Object({
@@ -311,8 +365,9 @@ export function registerTools(
 
 		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
 			// Connect to artifact by ID if provided (spawned agents use this)
+			let justConnected = false;
 			if (params.id && !state.artifact) {
-				const loaded = loadArtifactIfOwned(params.id as string);
+				const loaded = readArtifactFromDisk(params.id as string);
 				if (!loaded) {
 					return {
 						content: [{ type: "text" as const, text: `Artifact not found: ${params.id}` }],
@@ -320,6 +375,7 @@ export function registerTools(
 					};
 				}
 				state.artifact = loaded;
+				justConnected = true;
 			}
 
 			if (!state.artifact) {
@@ -347,22 +403,35 @@ export function registerTools(
 			const a = state.artifact;
 			const requestedKeys = params.keys as string[] | undefined;
 
-			// No keys: return header with available keys list
-			if (!requestedKeys || requestedKeys.length === 0) {
-				const header = {
+			// No keys OR just connected: return header with available keys list.
+			// When an agent connects via id, always show the header so they know
+			// what keys exist -- eliminates the guess-miss-header-retry pattern.
+			if (!requestedKeys || requestedKeys.length === 0 || justConnected) {
+				const header: Record<string, unknown> = {
 					id: a.id,
 					title: a.title,
 					type: a.type,
-					status: a.status,
 					description: a.description,
 					data_keys: Object.keys(a.data),
 					checkpoints: a.checkpoints,
 					created_at: a.created_at,
 					updated_at: a.updated_at,
 				};
+
+				// If caller also requested specific keys on connect, include them
+				if (justConnected && requestedKeys && requestedKeys.length > 0) {
+					const requested: Record<string, unknown> = {};
+					for (const key of requestedKeys) {
+						if (key in a.data) requested[key] = a.data[key];
+					}
+					if (Object.keys(requested).length > 0) {
+						header.requested_data = requested;
+					}
+				}
+
 				return {
 					content: [{ type: "text", text: JSON.stringify(header, null, 2) }],
-					details: { header: true, keys: Object.keys(a.data) },
+					details: { header: true, keys: Object.keys(a.data), connected: justConnected },
 				};
 			}
 
@@ -437,7 +506,7 @@ export function registerTools(
 		async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
 			if (!state.artifact) {
 				return {
-					content: [{ type: "text" as const, text: "No active artifact. Create one with ada_create." }],
+					content: [{ type: "text" as const, text: "No active artifact. Use ada_get with an artifact id to connect, or ada_create to start a new one." }],
 					details: {},
 				};
 			}
@@ -483,88 +552,4 @@ export function registerTools(
 		},
 	});
 
-	// ─── ada_close ────────────────────────────────────────────────
-
-	pi.registerTool({
-		name: "ada_close",
-		label: "Close Artifact",
-		description:
-			"Close or pause the active artifact. Use 'completed' when work is done, 'paused' to resume later. " +
-			"Optionally provide a summary of what was accomplished.",
-		promptSnippet: "Close or pause the active artifact",
-		parameters: Type.Object({
-			status: StringEnum(["completed", "paused"] as const, {
-				description: "Final status: completed (work done) or paused (resume later)",
-			}),
-			summary: Type.Optional(
-				Type.String({ description: "Brief summary of what was accomplished or the current state" }),
-			),
-		}),
-
-		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-			if (!state.artifact || state.artifact.status !== "active") {
-				return {
-					content: [{ type: "text" as const, text: "No active artifact to close." }],
-					details: {},
-				};
-			}
-
-			await acquireLock(state.artifact.id);
-			try {
-				const fresh = readArtifactFromDisk(state.artifact.id);
-				if (fresh && fresh.id === state.artifact.id) {
-					state.artifact.data = fresh.data;
-					state.artifact.checkpoints = fresh.checkpoints;
-				}
-
-				state.artifact.status = params.status as ArtifactStatus;
-				state.artifact.updated_at = new Date().toISOString();
-				if (params.summary) {
-					state.artifact.summary = params.summary;
-				}
-
-				writeArtifactToDisk(state.artifact);
-				persistState(pi, state);
-			} finally {
-				releaseLock(state.artifact.id);
-			}
-
-			const closedArtifact = JSON.parse(JSON.stringify(state.artifact)) as Artifact;
-			if (params.status === "completed") {
-				state.artifact = null;
-			}
-
-			return {
-				content: [{
-					type: "text",
-					text: `Artifact ${params.status}: "${closedArtifact.title}" (${Object.keys(closedArtifact.data).length} data keys, ${closedArtifact.checkpoints.length} checkpoints)\nFile: ${ARTIFACTS_DIR}/${closedArtifact.id}/artifact.json`,
-				}],
-				details: { artifact: closedArtifact },
-			};
-		},
-
-		renderCall(args, theme) {
-			const a = args as Record<string, unknown>;
-			return new Text(
-				theme.fg("toolTitle", theme.bold("ada_close ")) +
-				theme.fg("accent", `${a.status}`),
-				0, 0,
-			);
-		},
-
-		renderResult(result, { isPartial }, theme) {
-			if (isPartial) return new Text(theme.fg("dim", "Closing..."), 0, 0);
-			const details = result.details as { artifact?: Artifact } | undefined;
-			if (!details?.artifact) {
-				const text = result.content[0];
-				return new Text(text?.type === "text" ? text.text : "", 0, 0);
-			}
-			const a = details.artifact;
-			return new Text(
-				theme.fg("success", a.title) +
-				theme.fg("dim", ` — ${Object.keys(a.data).length} keys, ${a.status}`),
-				0, 0,
-			);
-		},
-	});
 }

@@ -9,9 +9,6 @@
  *   ~/.pi/agent/artifacts/{slug}/artifact.json
  */
 
-/** Artifact lifecycle status. */
-export type ArtifactStatus = "active" | "completed" | "paused";
-
 /** High-level artifact category for prompt context. */
 export type ArtifactType = "investigation" | "fix" | "review" | "planning" | "build" | "general";
 
@@ -33,10 +30,12 @@ export interface Artifact {
 	description?: string;
 	/** Category of work being tracked. */
 	type: ArtifactType;
-	/** Current lifecycle status. */
-	status: ArtifactStatus;
-	/** Pi session file that owns this artifact. Prevents cross-session leaking. */
-	session_id: string | null;
+	// Legacy fields kept optional for backward compat with old artifact.json files.
+	// Never set on new artifacts. Never used in logic.
+	/** @deprecated No longer used. Artifacts have no lifecycle status. */
+	status?: string;
+	/** @deprecated No longer used. Artifacts are not session-bound. */
+	session_id?: string | null;
 	/** ISO 8601 creation timestamp. */
 	created_at: string;
 	/** ISO 8601 last-update timestamp. */
@@ -62,8 +61,7 @@ export interface ADAState {
 	artifactUpdatedThisTurn: boolean;
 	/** Count of substantive tool calls this turn (for nudge heuristic). */
 	toolCallsThisTurn: number;
-	/** Current Pi session file path, set on session_start. */
-	sessionId: string | null;
+
 }
 
 /** Default artifacts directory. */

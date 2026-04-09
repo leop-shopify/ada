@@ -98,6 +98,56 @@ export function slugify(title: string): string {
 		.slice(0, 60);
 }
 
+/**
+ * Normalize a title for similarity comparison.
+ * Strips noise words, punctuation, numbers, and date-like fragments.
+ */
+export function normalizeTitle(title: string): string {
+	return title
+		.toLowerCase()
+		.replace(/[^a-z0-9\s]/g, " ")       // strip punctuation
+		.replace(/\b(the|a|an|and|or|for|of|in|on|at|to|by|is|it|its|with|from)\b/g, "") // noise words
+		.replace(/\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b/gi, "")          // month names
+		.replace(/\b\d{1,4}\b/g, "")          // standalone numbers (dates, IDs kept only if long)
+		.replace(/\s+/g, " ")
+		.trim();
+}
+
+/**
+ * Find existing artifacts whose title is similar to the proposed one.
+ * Returns artifacts that share >60% of normalized words with the input.
+ * Used to prevent near-duplicate creation.
+ */
+export function findSimilarArtifacts(title: string, exclude?: string): Array<{ artifact: Artifact; similarity: number }> {
+	const all = listArtifactsFromDisk();
+	const normInput = normalizeTitle(title);
+	const inputWords = new Set(normInput.split(" ").filter(Boolean));
+	if (inputWords.size === 0) return [];
+
+	const results: Array<{ artifact: Artifact; similarity: number }> = [];
+
+	for (const a of all) {
+		if (exclude && a.id === exclude) continue;
+		const normExisting = normalizeTitle(a.title);
+		const existingWords = new Set(normExisting.split(" ").filter(Boolean));
+		if (existingWords.size === 0) continue;
+
+		// Jaccard similarity: intersection / union
+		let intersection = 0;
+		for (const w of inputWords) {
+			if (existingWords.has(w)) intersection++;
+		}
+		const union = new Set([...inputWords, ...existingWords]).size;
+		const similarity = union > 0 ? intersection / union : 0;
+
+		if (similarity >= 0.5) {
+			results.push({ artifact: a, similarity });
+		}
+	}
+
+	return results.sort((a, b) => b.similarity - a.similarity);
+}
+
 /** Get the directory path for an artifact by its ID (slug). */
 export function artifactDir(id: string): string {
 	return join(ARTIFACTS_DIR, id);
@@ -167,11 +217,9 @@ export function persistState(pi: ExtensionAPI, state: ADAState): void {
 			artifact: state.artifact
 				? {
 						id: state.artifact.id,
-						status: state.artifact.status,
 						title: state.artifact.title,
 						dataKeys: Object.keys(state.artifact.data).length,
 						checkpoints: state.artifact.checkpoints.length,
-						session_id: state.artifact.session_id,
 					}
 				: null,
 		},
@@ -179,15 +227,15 @@ export function persistState(pi: ExtensionAPI, state: ADAState): void {
 }
 
 /**
- * Clean up completed artifact subfolders older than maxAgeDays.
- * Active and paused artifacts are never cleaned.
+ * Clean up artifact subfolders older than maxAgeDays.
+ * Only removes artifacts not updated within the cutoff.
  */
 export function cleanupOldArtifacts(maxAgeDays: number = 7): number {
 	const cutoff = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
 	const all = listArtifactsFromDisk();
 	let cleaned = 0;
 	for (const a of all) {
-		if (a.status === "completed" && new Date(a.updated_at).getTime() < cutoff) {
+		if (new Date(a.updated_at).getTime() < cutoff) {
 			const dir = artifactDir(a.id);
 			try {
 				rmSync(dir, { recursive: true, force: true });
