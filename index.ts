@@ -40,7 +40,7 @@ const SUBSTANTIVE_TOOLS = new Set([
 ]);
 
 /** Minimum substantive tool calls before nudging. */
-const NUDGE_THRESHOLD = 4;
+const NUDGE_THRESHOLD = 2;
 
 export default function adaExtension(pi: ExtensionAPI): void {
 	// ─── Spawned Agent Detection ───────────────────────────────────
@@ -160,10 +160,12 @@ Use ada_get with specific key names above to load data when needed.`,
 		if (state.artifactUpdatedThisTurn) return;
 		if (state.toolCallsThisTurn < NUDGE_THRESHOLD) return;
 
+		const severity = state.toolCallsThisTurn >= 4 ? "OVERDUE" : "REMINDER";
 		pi.sendMessage(
 			{
 				customType: "ada-nudge",
-				content: `You made ${state.toolCallsThisTurn} tool calls this turn but didn't update the artifact. Consider using ada_update to log what you found or decided.`,
+				content: `[${severity}] You made ${state.toolCallsThisTurn} substantive tool calls this turn without a checkpoint or update. ` +
+					`Checkpoint what you found before continuing. One discovery, one checkpoint.`,
 				display: true,
 			},
 			{ triggerTurn: false },
@@ -309,7 +311,12 @@ Use ada_get with specific key names above to load data when needed.`,
 		input.task += `\n\nActive ADA artifact: ${artifactId}\n` +
 			`Artifact folder: ${dir}/\n` +
 			`Use ada_get with id="${artifactId}" to connect, then ada_update to write findings.` +
-			keysInfo;
+			keysInfo +
+			`\n\nCHECKPOINT DISCIPLINE (mandatory):\n` +
+			`Checkpoint after EVERY meaningful step. Never batch.\n` +
+			`For code changes: one edit, one test run, one checkpoint.\n` +
+			`For research: one search+discovery, one checkpoint. If you called 2+ tools since your last checkpoint, you are overdue.\n` +
+			`Each checkpoint says what you found or changed, not the overall status. Granular, not summary.`;
 	});
 
 	// ─── Register Tools ─────────────────────────────────────────────

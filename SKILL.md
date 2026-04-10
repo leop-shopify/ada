@@ -22,9 +22,11 @@ demands. Nested objects, arrays, measurements, people, questions, files -- anyth
 This is the substance. You read it, update it, query specific keys, and build on it
 every iteration.
 
-**checkpoints** -- milestones that mark meaningful progress. Not a journal. Not every
-action. Just the moments that matter: "baseline measured", "root cause found",
-"3/8 interviews complete".
+**checkpoints** -- granular progress markers that track every meaningful change.
+For fix, build, and investigation work: one change, one test run, one checkpoint.
+Never batch multiple changes into a single checkpoint. The trail must show what
+each individual change did in isolation. For planning and review work, checkpoints
+can be coarser (phase transitions, decisions made).
 
 ## Tools
 
@@ -43,7 +45,9 @@ parameter to connect to an artifact they were told about by the lead.
 `ada_read` -- Full load. Returns everything. Use when resuming from another session
 or when you genuinely need the complete picture. Expensive on context.
 
-`ada_checkpoint` -- Mark a milestone. One sentence about what was reached.
+`ada_checkpoint` -- Mark progress. One sentence about what was reached or changed.
+For iterative work (fixes, builds, investigations): checkpoint after every change
+and every test run. This is non-negotiable.
 
 There is no ada_close. Artifacts do not close. To switch, use /ada-resume.
 
@@ -212,6 +216,51 @@ the tool will reject the call with a BLOCKED error:
 
 If you get BLOCKED, the error message tells you which existing artifact to resume.
 Use /ada-resume <id> to switch to it.
+
+## Checkpoint discipline
+
+Checkpoints are granular. Every meaningful discovery, every change, every test run
+gets its own checkpoint. This applies to ALL artifact types and ALL agents.
+
+### For fix and build work:
+
+1. Make a change (edit a file, apply a fix, modify config)
+2. Run the test or verification
+3. Checkpoint with: what you changed, the test result, what changed from the previous run
+4. If the test fails: note the new error before moving to the next change
+
+Good: "Fix 1: changed nav selector from locator('nav').first() to
+getByRole('navigation', {name: /settings menu/i}). Test run: 6 more subpages pass,
+new failure at Gift cards link."
+
+Bad: "Applied fixes 1, 2, and 3. Tests pass now."
+
+### For research and investigation work:
+
+1. Search for something (grokt_search, file read, API call)
+2. Find something meaningful (a model, a consumer, a pattern, a connection)
+3. Checkpoint with: what you searched for, what you found, how it connects
+4. Move to the next search
+
+Good: "Found Handle model in app/models/handle.rb -- GlobalDbRecord, belongs_to
+:resource (polymorphic). Broker includes Handle::ResourceConcerns, giving it
+has_many :handles."
+
+Good: "Identified 3 consumers of broker_handle: StorefrontRenderer (GraphQL),
+ShopMobileApp (REST API), AdminWeb (internal). Each uses Handle.find_by_handle."
+
+Bad: "Mapped the full broker_handle architecture." (too coarse -- what did you find?)
+
+Bad: "Searched several files and found the data flow." (batched -- checkpoint each find)
+
+The rule of thumb: if you called 2+ substantive tools (search, read, query) since
+your last checkpoint, you are overdue. Checkpoint what you learned before continuing.
+
+### Universal rules:
+
+- This applies to the lead AND to spawned agents. No exceptions, no batching.
+- Even when you can see the next step, checkpoint the current finding first.
+- The checkpoint records what THIS step accomplished, not the overall status.
 
 ## What NOT to do
 
