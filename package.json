@@ -1,0 +1,16 @@
+{
+  "name": "ada-for-pi",
+  "version": "1.0.0",
+  "description": "ADA - Artifact Driven Agent. Structured JSON artifacts for iterative multi-step work in pi.",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./index.ts"],
+    "skills": ["./SKILL.md"]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-tui": "*",
+    "@sinclair/typebox": "*"
+  }
+}
