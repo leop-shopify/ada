@@ -1,0 +1,621 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ADA Artifact Inspector</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --bg-card: #161b22;
+    --bg-hover: #1c2129;
+    --bg-agent: #1a1f27;
+    --border: #30363d;
+    --text: #c9d1d9;
+    --text-dim: #8b949e;
+    --text-bright: #f0f6fc;
+    --accent: #58a6ff;
+    --accent-dim: #1f6feb;
+    --green: #3fb950;
+    --yellow: #d29922;
+    --orange: #db6d28;
+    --red: #f85149;
+    --purple: #bc8cff;
+    --pink: #f778ba;
+    --cyan: #39d2c0;
+    --radius: 8px;
+    --mono: 'SF Mono','Fira Code','JetBrains Mono',Consolas,monospace;
+    --sans: -apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:var(--bg); color:var(--text); font-family:var(--sans); font-size:14px; line-height:1.6; }
+
+  .container { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+
+  /* ── Header ── */
+  .header { text-align:center; margin-bottom:40px; }
+  .header h1 { font-size:26px; font-weight:700; color:var(--text-bright); margin-bottom:10px; }
+  .header .meta { display:flex; gap:10px; justify-content:center; flex-wrap:wrap; margin-bottom:8px; }
+  .tag { padding:3px 10px; border-radius:16px; font-size:12px; font-weight:500; background:var(--bg-card); border:1px solid var(--border); }
+  .tag.type { color:var(--purple); border-color:var(--purple); }
+  .tag.keys { color:var(--cyan); border-color:var(--cyan); }
+  .tag.cps { color:var(--green); border-color:var(--green); }
+  .tag.agents { color:var(--orange); border-color:var(--orange); }
+  .tag.dur { color:var(--yellow); border-color:var(--yellow); }
+  .tag.sz { color:var(--text-dim); }
+  .header .desc { color:var(--text-dim); font-size:13px; max-width:640px; margin:8px auto 0; }
+  .header .id { font-family:var(--mono); font-size:11px; color:var(--text-dim); margin-top:6px; }
+
+  /* ── Stats ── */
+  .stats { display:flex; gap:12px; justify-content:center; flex-wrap:wrap; margin-bottom:40px; }
+  .stat { background:var(--bg-card); border:1px solid var(--border); border-radius:var(--radius); padding:14px 20px; text-align:center; min-width:130px; }
+  .stat .l { font-size:10px; font-weight:600; text-transform:uppercase; letter-spacing:.05em; color:var(--text-dim); margin-bottom:2px; }
+  .stat .v { font-size:18px; font-weight:700; color:var(--text-bright); }
+  .stat .s { font-size:11px; color:var(--text-dim); }
+
+  /* ── Section ── */
+  .section { margin-bottom:44px; }
+  .section-title { font-size:17px; font-weight:700; color:var(--text-bright); margin-bottom:16px; padding-bottom:6px; border-bottom:1px solid var(--border); }
+
+  /* ── Legend ── */
+  .legend { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:20px; }
+  .legend-item { display:inline-flex; align-items:center; gap:5px; padding:3px 9px; border-radius:16px; font-size:11px; font-family:var(--mono); border:1px solid; cursor:pointer; user-select:none; transition:opacity .15s; }
+  .legend-item:hover { opacity:.8; }
+  .legend-item.off { opacity:.2; }
+  .legend-item .dot { width:7px; height:7px; border-radius:50%; }
+  .legend-item .cnt { font-weight:700; opacity:.6; }
+
+  /* ── Timeline ── */
+  .timeline {}
+
+  /* Lead checkpoint */
+  .cp-lead {
+    display:grid;
+    grid-template-columns:60px 12px 1fr;
+    gap:0 10px;
+    align-items:start;
+    padding:6px 0;
+    border-bottom:1px solid transparent;
+    transition:background .1s;
+  }
+  .cp-lead:hover { background:var(--bg-card); border-radius:6px; }
+
+  .cp-lead .time {
+    text-align:right;
+    font-family:var(--mono);
+    font-size:11px;
+    color:var(--text-dim);
+    padding-top:2px;
+    white-space:nowrap;
+  }
+  .cp-lead .dot-col {
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    padding-top:5px;
+  }
+  .cp-lead .dot {
+    width:10px; height:10px; border-radius:50%;
+    flex-shrink:0;
+  }
+  .cp-lead .line {
+    width:2px; flex:1; min-height:20px;
+  }
+  .cp-lead .body {
+    padding-top:1px;
+  }
+  .cp-lead .body .text {
+    font-size:13px;
+    color:var(--text);
+    line-height:1.5;
+  }
+  .cp-lead .body .idx {
+    font-family:var(--mono);
+    font-size:10px;
+    color:var(--text-dim);
+    opacity:.5;
+    margin-left:6px;
+  }
+
+  /* Agent group (branch) */
+  .branch {
+    margin:8px 0 8px 42px;
+    border-left:3px solid var(--border);
+    border-radius:0 var(--radius) var(--radius) 0;
+    background:var(--bg-agent);
+    overflow:hidden;
+    transition:opacity .2s;
+  }
+
+  .branch.dimmed { opacity:.1; }
+
+  .branch-header {
+    display:flex;
+    align-items:center;
+    gap:10px;
+    padding:10px 14px;
+    cursor:pointer;
+    user-select:none;
+    transition:background .1s;
+  }
+  .branch-header:hover { background:var(--bg-hover); }
+
+  .branch-header .arrow {
+    font-size:10px;
+    color:var(--text-dim);
+    transition:transform .15s;
+    width:14px;
+    text-align:center;
+  }
+  .branch-header .arrow.open { transform:rotate(90deg); }
+
+  .branch-header .agent-names {
+    display:flex;
+    flex-wrap:wrap;
+    gap:6px;
+  }
+
+  .branch-header .agent-tag {
+    font-family:var(--mono);
+    font-size:12px;
+    font-weight:600;
+    padding:2px 8px;
+    border-radius:4px;
+  }
+
+  .branch-header .cp-count {
+    font-size:11px;
+    color:var(--text-dim);
+    margin-left:auto;
+    font-family:var(--mono);
+    white-space:nowrap;
+  }
+
+  .branch-body {
+    display:none;
+    padding:0 0 6px;
+  }
+  .branch-body.open { display:block; }
+
+  /* Agent lane inside a branch */
+  .lane {
+    margin:0 8px 0 16px;
+    transition:opacity .2s;
+  }
+  .lane.dimmed { opacity:.1; }
+
+  .lane-label {
+    display:flex;
+    align-items:center;
+    gap:6px;
+    padding:6px 8px 2px;
+    font-family:var(--mono);
+    font-size:11px;
+    font-weight:600;
+  }
+  .lane-label .dot { width:7px; height:7px; border-radius:50%; }
+
+  .lane-cp {
+    display:grid;
+    grid-template-columns:54px 1fr;
+    gap:0 8px;
+    padding:3px 8px;
+    border-radius:4px;
+    transition:background .1s;
+  }
+  .lane-cp:hover { background:rgba(255,255,255,.03); }
+
+  .lane-cp .time {
+    text-align:right;
+    font-family:var(--mono);
+    font-size:10px;
+    color:var(--text-dim);
+    padding-top:2px;
+    white-space:nowrap;
+  }
+  .lane-cp .text {
+    font-size:13px;
+    color:var(--text);
+    line-height:1.45;
+  }
+  .lane-cp .idx {
+    font-family:var(--mono);
+    font-size:10px;
+    color:var(--text-dim);
+    opacity:.4;
+    margin-left:4px;
+  }
+
+  /* ── Data Keys ── */
+  .data-grid {
+    display:grid;
+    grid-template-columns:repeat(auto-fill,minmax(260px,1fr));
+    gap:5px;
+  }
+  .data-key {
+    display:flex;
+    justify-content:space-between;
+    align-items:center;
+    padding:5px 10px;
+    background:var(--bg-card);
+    border:1px solid var(--border);
+    border-radius:6px;
+    font-family:var(--mono);
+    font-size:11px;
+    cursor:pointer;
+    transition:border-color .12s;
+  }
+  .data-key:hover { border-color:var(--accent); }
+  .data-key .name { color:var(--accent); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1; margin-right:6px; }
+  .data-key .tb { font-size:10px; padding:1px 5px; border-radius:3px; font-weight:600; flex-shrink:0; }
+  .tb.string { background:#1a3a1a; color:var(--green); }
+  .tb.number { background:#1a2a3a; color:var(--accent); }
+  .tb.boolean { background:#3a2a1a; color:var(--yellow); }
+  .tb.array { background:#2a1a3a; color:var(--purple); }
+  .tb.object { background:#1a2a2a; color:var(--cyan); }
+  .tb.null { background:#2a1a1a; color:var(--text-dim); }
+
+  /* ── Session artifacts ── */
+  .sa-grid {
+    display:grid;
+    grid-template-columns:repeat(auto-fill,minmax(300px,1fr));
+    gap:5px;
+  }
+  .sa-item {
+    padding:7px 10px;
+    background:var(--bg-card);
+    border:1px solid var(--border);
+    border-radius:6px;
+    font-size:12px;
+  }
+  .sa-item.current { border-color:var(--accent-dim); }
+  .sa-item .t { color:var(--text); font-weight:500; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .sa-item .m { color:var(--text-dim); font-family:var(--mono); font-size:10px; }
+
+  /* ── Modal ── */
+  .modal-overlay {
+    display:none; position:fixed; top:0;left:0;right:0;bottom:0;
+    background:rgba(0,0,0,.6); z-index:100; align-items:center; justify-content:center;
+  }
+  .modal-overlay.visible { display:flex; }
+  .modal {
+    background:var(--bg-card); border:1px solid var(--border); border-radius:var(--radius);
+    max-width:720px; width:90%; max-height:80vh; overflow:auto; padding:24px;
+  }
+  .modal h3 { font-family:var(--mono); color:var(--accent); font-size:13px; margin-bottom:10px; }
+  .modal pre {
+    background:var(--bg); border:1px solid var(--border); border-radius:6px;
+    padding:14px; font-family:var(--mono); font-size:12px; line-height:1.5;
+    color:var(--text); overflow-x:auto; white-space:pre-wrap; word-break:break-word;
+  }
+  .modal .close-btn {
+    float:right; background:none; border:none; color:var(--text-dim);
+    font-size:18px; cursor:pointer; padding:4px 8px; border-radius:4px;
+  }
+  .modal .close-btn:hover { background:var(--bg-hover); color:var(--text); }
+
+  /* ── Drop zone ── */
+  .drop-zone {
+    display:flex; flex-direction:column; align-items:center; justify-content:center;
+    min-height:60vh; border:2px dashed var(--border); border-radius:12px;
+    padding:40px; text-align:center; cursor:pointer; transition:border-color .2s;
+  }
+  .drop-zone.dragover { border-color:var(--accent); background:rgba(88,166,255,.04); }
+  .drop-zone h2 { color:var(--text-bright); font-size:24px; margin-bottom:10px; }
+  .drop-zone p { color:var(--text-dim); font-size:14px; max-width:380px; }
+  .drop-zone input[type="file"] { display:none; }
+
+  ::-webkit-scrollbar { width:8px; height:8px; }
+  ::-webkit-scrollbar-track { background:transparent; }
+  ::-webkit-scrollbar-thumb { background:var(--border); border-radius:4px; }
+  ::-webkit-scrollbar-thumb:hover { background:var(--text-dim); }
+</style>
+</head>
+<body>
+
+<div id="drop-zone-container" class="container">
+  <div class="drop-zone" id="dropZone">
+    <h2>ADA Artifact Inspector</h2>
+    <p>Drop an artifact.json file here, or click to browse.</p>
+    <input type="file" id="fileInput" accept=".json">
+  </div>
+</div>
+
+<div id="app" style="display:none;"></div>
+
+<div class="modal-overlay" id="modalOverlay">
+  <div class="modal" id="modal"></div>
+</div>
+
+<script>
+const COLORS = [
+  '#3fb950','#d29922','#bc8cff','#f778ba','#39d2c0','#db6d28','#f85149',
+  '#79c0ff','#56d364','#e3b341','#d2a8ff','#ff9bce','#a5d6ff','#7ee787',
+  '#f0883e','#ff7b72','#6cb6ff','#2ea043','#b08800','#da3633',
+];
+const LEAD_CLR = '#58a6ff';
+
+function clr(n) {
+  if (n === 'lead') return LEAD_CLR;
+  let h = 0;
+  for (let i = 0; i < n.length; i++) h = ((h << 5) - h + n.charCodeAt(i)) | 0;
+  return COLORS[Math.abs(h) % COLORS.length];
+}
+
+function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function ago(d) { const s=Math.floor((Date.now()-new Date(d).getTime())/1000); if(s<60)return s+'s'; const m=Math.floor(s/60); if(m<60)return m+'m'; const h=Math.floor(m/60); if(h<24)return h+'h'; return Math.floor(h/24)+'d'; }
+function ftime(d) { return new Date(d).toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}); }
+function fdate(d) { return new Date(d).toLocaleDateString('en-US',{year:'numeric',month:'short',day:'numeric'}); }
+function tof(v) { if(v===null||v===undefined)return'null'; if(Array.isArray(v))return'array'; return typeof v; }
+function dsz(v) { const s=JSON.stringify(v).length; return s<1024?s+' B':(s/1024).toFixed(1)+' KB'; }
+
+function parseAgent(note) {
+  if (note.startsWith('[@')) {
+    const e = note.indexOf(']');
+    if (e > 2) return { agent: note.substring(2, e), text: note.substring(e + 2).trim() };
+  }
+  return { agent: 'lead', text: note };
+}
+
+// Split checkpoints into parts: { type:'lead', cps:[...] } or { type:'branch', cps:[...], agents:[name,...] }
+function buildParts(checkpoints) {
+  const parsed = checkpoints.map((cp, i) => ({ ...cp, ...parseAgent(cp.note), index: i }));
+  const parts = [];
+  let i = 0;
+  while (i < parsed.length) {
+    if (parsed[i].agent === 'lead') {
+      const start = i;
+      while (i < parsed.length && parsed[i].agent === 'lead') i++;
+      parts.push({ type: 'lead', cps: parsed.slice(start, i) });
+    } else {
+      const start = i;
+      while (i < parsed.length && parsed[i].agent !== 'lead') i++;
+      const cps = parsed.slice(start, i);
+      const agentOrder = [];
+      const seen = new Set();
+      for (const cp of cps) { if (!seen.has(cp.agent)) { agentOrder.push(cp.agent); seen.add(cp.agent); } }
+      parts.push({ type: 'branch', cps, agents: agentOrder });
+    }
+  }
+  return parts;
+}
+
+let artifact = null;
+let siblingArtifacts = [];
+let activeFilter = null;
+
+function render() {
+  document.getElementById('drop-zone-container').style.display = 'none';
+  const app = document.getElementById('app');
+  app.style.display = 'block';
+  document.title = 'ADA: ' + artifact.title;
+
+  const a = artifact;
+  const cps = a.checkpoints || [];
+  const dk = Object.keys(a.data || {}).sort();
+  const sz = JSON.stringify(a).length;
+
+  const agentCounts = {};
+  for (const cp of cps) { const { agent } = parseAgent(cp.note); agentCounts[agent] = (agentCounts[agent]||0)+1; }
+  const agents = Object.entries(agentCounts).sort((a,b) => b[1]-a[1]);
+  const nAgents = agents.filter(([n])=>n!=='lead').length;
+
+  let dur = '';
+  if (cps.length >= 2) {
+    const ms = new Date(cps[cps.length-1].timestamp) - new Date(cps[0].timestamp);
+    const h = Math.floor(ms/3600000), m = Math.floor((ms%3600000)/60000);
+    dur = h > 0 ? h+'h '+m+'m' : m+'m';
+  }
+
+  let html = '<div class="container">';
+
+  // Header
+  html += `<div class="header">
+    <h1>${esc(a.title)}</h1>
+    <div class="meta">
+      <span class="tag type">${a.type||'general'}</span>
+      <span class="tag keys">${dk.length} keys</span>
+      <span class="tag cps">${cps.length} checkpoints</span>
+      ${nAgents?`<span class="tag agents">${nAgents+1} agents</span>`:''}
+      ${dur?`<span class="tag dur">${dur}</span>`:''}
+      <span class="tag sz">${(sz/1024).toFixed(1)} KB</span>
+    </div>
+    ${a.description?`<div class="desc">${esc(a.description)}</div>`:''}
+    <div class="id">${esc(a.id)}</div>
+  </div>`;
+
+  // Stats
+  html += `<div class="stats">
+    <div class="stat"><div class="l">Created</div><div class="v" style="font-size:15px">${fdate(a.created_at)}</div><div class="s">${ftime(a.created_at)}</div></div>
+    <div class="stat"><div class="l">Updated</div><div class="v" style="font-size:15px">${fdate(a.updated_at)}</div><div class="s">${ago(a.updated_at)} ago</div></div>
+    <div class="stat"><div class="l">Data</div><div class="v" style="font-size:15px">${dsz(a.data||{})}</div><div class="s">${dk.length} keys</div></div>
+    <div class="stat"><div class="l">Checkpoints</div><div class="v">${cps.length}</div><div class="s">${nAgents?nAgents+1+' agents':'single agent'}</div></div>
+  </div>`;
+
+  // Execution tree
+  if (cps.length > 0) {
+    html += `<div class="section">
+      <div class="section-title">Execution Tree</div>`;
+
+    // Legend
+    if (agents.length > 1) {
+      html += '<div class="legend">';
+      for (const [name, count] of agents) {
+        const c = clr(name);
+        html += `<div class="legend-item" data-agent="${esc(name)}" style="border-color:${c};color:${c};" onclick="toggleFilter('${esc(name)}')">
+          <span class="dot" style="background:${c}"></span>
+          ${esc(name==='lead'?'LEAD':name)}
+          <span class="cnt">${count}</span>
+        </div>`;
+      }
+      html += '</div>';
+    }
+
+    const parts = buildParts(cps);
+    html += '<div class="timeline">';
+
+    let branchIdx = 0;
+    for (const part of parts) {
+      if (part.type === 'lead') {
+        for (const cp of part.cps) {
+          const dim = activeFilter && activeFilter !== 'lead' ? ' dimmed' : '';
+          html += `<div class="cp-lead${dim}" data-agent="lead">
+            <div class="time">${ftime(cp.timestamp)}</div>
+            <div class="dot-col"><div class="dot" style="background:${LEAD_CLR}"></div><div class="line" style="background:${LEAD_CLR}"></div></div>
+            <div class="body"><span class="text">${esc(cp.text)}</span><span class="idx">#${cp.index}</span></div>
+          </div>`;
+        }
+      } else {
+        const bid = 'branch-' + branchIdx++;
+        const totalCps = part.cps.length;
+        const borderColor = part.agents.length === 1 ? clr(part.agents[0]) : 'var(--border)';
+        const dim = activeFilter && !part.agents.includes(activeFilter) ? ' dimmed' : '';
+
+        html += `<div class="branch${dim}" data-agents="${esc(part.agents.join(','))}" style="border-left-color:${borderColor}">`;
+        html += `<div class="branch-header" onclick="toggleBranch('${bid}')">
+          <span class="arrow" id="${bid}-arrow">&#9654;</span>
+          <span class="agent-names">`;
+        for (const name of part.agents) {
+          const c = clr(name);
+          html += `<span class="agent-tag" style="background:${c}22;color:${c};">@${esc(name)}</span>`;
+        }
+        html += `</span><span class="cp-count">${totalCps} checkpoints</span></div>`;
+
+        html += `<div class="branch-body" id="${bid}">`;
+
+        // Group consecutive checkpoints by agent within this branch
+        const lanes = [];
+        let ci = 0;
+        while (ci < part.cps.length) {
+          const ag = part.cps[ci].agent;
+          const start = ci;
+          while (ci < part.cps.length && part.cps[ci].agent === ag) ci++;
+          lanes.push({ agent: ag, cps: part.cps.slice(start, ci) });
+        }
+
+        for (const lane of lanes) {
+          const c = clr(lane.agent);
+          const laneDim = activeFilter && activeFilter !== lane.agent ? ' dimmed' : '';
+          html += `<div class="lane${laneDim}" data-agent="${esc(lane.agent)}">`;
+          html += `<div class="lane-label"><span class="dot" style="background:${c}"></span><span style="color:${c}">@${esc(lane.agent)}</span></div>`;
+          for (const cp of lane.cps) {
+            html += `<div class="lane-cp">
+              <div class="time">${ftime(cp.timestamp)}</div>
+              <div class="text">${esc(cp.text)}<span class="idx">#${cp.index}</span></div>
+            </div>`;
+          }
+          html += '</div>';
+        }
+
+        html += '</div></div>';
+      }
+    }
+
+    html += '</div></div>';
+  }
+
+  // Data keys
+  if (dk.length > 0) {
+    html += `<div class="section">
+      <div class="section-title">Data Keys (${dk.length})</div>
+      <div class="data-grid">`;
+    for (const key of dk) {
+      const v = a.data[key];
+      const t = tof(v);
+      html += `<div class="data-key" onclick="showKey('${esc(key)}')">
+        <span class="name">${esc(key)}</span>
+        <span class="tb ${t}">${t} ${dsz(v)}</span>
+      </div>`;
+    }
+    html += '</div></div>';
+  }
+
+  // Session artifacts
+  if (siblingArtifacts.length > 0) {
+    html += `<div class="section">
+      <div class="section-title">Other Artifacts (${siblingArtifacts.length})</div>
+      <div class="sa-grid">`;
+    for (const sa of siblingArtifacts) {
+      if (sa.id === a.id) continue;
+      html += `<div class="sa-item">
+        <div class="t">${esc(sa.title||sa.id)}</div>
+        <div class="m">${sa.type||'general'} / ${ago(sa.updated_at)} ago</div>
+      </div>`;
+    }
+    html += '</div></div>';
+  }
+
+  html += '</div>';
+  app.innerHTML = html;
+}
+
+// ── Interactivity ──
+function toggleBranch(id) {
+  const body = document.getElementById(id);
+  const arrow = document.getElementById(id + '-arrow');
+  if (!body) return;
+  const open = body.classList.toggle('open');
+  arrow.classList.toggle('open', open);
+}
+
+function toggleFilter(agent) {
+  activeFilter = activeFilter === agent ? null : agent;
+
+  document.querySelectorAll('.legend-item').forEach(el => {
+    el.classList.toggle('off', activeFilter && el.dataset.agent !== activeFilter);
+  });
+
+  document.querySelectorAll('.cp-lead').forEach(el => {
+    if (!activeFilter) { el.style.opacity = ''; return; }
+    el.style.opacity = el.dataset.agent === activeFilter ? '' : '.1';
+  });
+
+  document.querySelectorAll('.branch').forEach(el => {
+    if (!activeFilter) { el.classList.remove('dimmed'); return; }
+    const agents = (el.dataset.agents || '').split(',');
+    el.classList.toggle('dimmed', !agents.includes(activeFilter));
+  });
+
+  document.querySelectorAll('.lane').forEach(el => {
+    if (!activeFilter) { el.classList.remove('dimmed'); return; }
+    el.classList.toggle('dimmed', el.dataset.agent !== activeFilter);
+  });
+}
+
+function showKey(key) {
+  const val = artifact.data[key];
+  const m = document.getElementById('modal');
+  m.innerHTML = `<button class="close-btn" onclick="closeModal()">x</button>
+    <h3>${esc(key)}</h3>
+    <pre>${esc(JSON.stringify(val, null, 2))}</pre>`;
+  document.getElementById('modalOverlay').classList.add('visible');
+}
+
+function closeModal() { document.getElementById('modalOverlay').classList.remove('visible'); }
+document.getElementById('modalOverlay').addEventListener('click', e => { if(e.target===e.currentTarget) closeModal(); });
+document.addEventListener('keydown', e => { if(e.key==='Escape') closeModal(); });
+
+// ── File loading ──
+function load(json) {
+  try { artifact = JSON.parse(json); } catch(e) { alert('Invalid JSON: '+e.message); return; }
+  if (!artifact.id && !artifact.title) { alert('Not an ADA artifact.'); return; }
+  render();
+}
+
+const dz = document.getElementById('dropZone');
+const fi = document.getElementById('fileInput');
+dz.addEventListener('click', () => fi.click());
+dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('dragover'); });
+dz.addEventListener('dragleave', () => dz.classList.remove('dragover'));
+dz.addEventListener('drop', e => { e.preventDefault(); dz.classList.remove('dragover'); const f=e.dataTransfer.files[0]; if(f){const r=new FileReader();r.onload=()=>load(r.result);r.readAsText(f);} });
+fi.addEventListener('change', () => { const f=fi.files[0]; if(f){const r=new FileReader();r.onload=()=>load(r.result);r.readAsText(f);} });
+
+// ── Inline data injection (used by ada-inspect command) ──
+if (window.__ADA_ARTIFACT__) {
+  artifact = window.__ADA_ARTIFACT__;
+  siblingArtifacts = window.__ADA_SIBLINGS__ || [];
+  render();
+}
+</script>
+</body>
+</html>

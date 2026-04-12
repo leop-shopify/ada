@@ -1,12 +1,14 @@
 /**
  * ADA Helpers — disk I/O, state persistence, artifact discovery.
  *
- * Storage layout: artifacts/{slug}/artifact.json
+ * Storage layout:
+ *   New: artifacts/{yyyymmdd}/{slug}/artifact.json
+ *   Legacy: artifacts/{slug}/artifact.json (still supported for reads)
  * Each artifact gets its own subfolder for future extensibility (logs, data, etc.)
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { type Dirent, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ADAState, Artifact } from "./types.js";
 import { ARTIFACTS_DIR } from "./types.js";
@@ -148,14 +150,47 @@ export function findSimilarArtifacts(title: string, exclude?: string): Array<{ a
 	return results.sort((a, b) => b.similarity - a.similarity);
 }
 
-/** Get the directory path for an artifact by its ID (slug). */
+/**
+ * Resolve an existing artifact's directory on disk.
+ * Checks new-style date-prefixed paths (artifacts/yyyymmdd/slug/) first,
+ * then falls back to old-style flat paths (artifacts/slug/).
+ * Returns null if the artifact doesn't exist anywhere.
+ */
+export function resolveArtifactDir(id: string): string | null {
+	ensureArtifactsDir();
+	try {
+		const entries = readdirSync(ARTIFACTS_DIR, { withFileTypes: true });
+		// Check new-style: artifacts/yyyymmdd/slug/
+		for (const entry of entries) {
+			if (!entry.isDirectory() || !/^\d{8}$/.test(entry.name)) continue;
+			const candidate = join(ARTIFACTS_DIR, entry.name, id, "artifact.json");
+			if (existsSync(candidate)) return join(ARTIFACTS_DIR, entry.name, id);
+		}
+		// Check old-style: artifacts/slug/
+		const oldStyle = join(ARTIFACTS_DIR, id, "artifact.json");
+		if (existsSync(oldStyle)) return join(ARTIFACTS_DIR, id);
+	} catch { /* dir doesn't exist yet */ }
+	return null;
+}
+
+/** Generate a new-style date-prefixed directory for artifact creation. */
+export function newArtifactDir(id: string): string {
+	const today = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+	return join(ARTIFACTS_DIR, today, id);
+}
+
+/**
+ * Get the directory path for an artifact by its ID (slug).
+ * Resolves to the existing location (old or new style) if found,
+ * otherwise returns a new-style date-prefixed path.
+ */
 export function artifactDir(id: string): string {
-	return join(ARTIFACTS_DIR, id);
+	return resolveArtifactDir(id) ?? newArtifactDir(id);
 }
 
 /** Get the JSON file path for an artifact. */
 export function artifactFilePath(id: string): string {
-	return join(ARTIFACTS_DIR, id, "artifact.json");
+	return join(artifactDir(id), "artifact.json");
 }
 
 /** Ensure the artifacts root directory exists. */
@@ -189,20 +224,42 @@ export function readArtifactFromDisk(id: string): Artifact | null {
 	}
 }
 
-/** List all artifacts on disk, sorted by updated_at descending. */
+/** List all artifacts on disk, sorted by updated_at descending.
+ *  Scans both old-style (artifacts/slug/) and new-style (artifacts/yyyymmdd/slug/) layouts.
+ */
 export function listArtifactsFromDisk(): Artifact[] {
 	ensureArtifactsDir();
 	const entries = readdirSync(ARTIFACTS_DIR, { withFileTypes: true });
 	const artifacts: Artifact[] = [];
+	const seen = new Set<string>();
+
 	for (const entry of entries) {
 		if (!entry.isDirectory()) continue;
-		const filePath = join(ARTIFACTS_DIR, entry.name, "artifact.json");
-		if (!existsSync(filePath)) continue;
-		try {
-			const raw = readFileSync(filePath, "utf-8");
-			artifacts.push(JSON.parse(raw) as Artifact);
-		} catch {
-			// Skip corrupt files
+
+		if (/^\d{8}$/.test(entry.name)) {
+			// New-style date dir: scan subdirectories for artifact.json
+			const datePath = join(ARTIFACTS_DIR, entry.name);
+			let subEntries: Dirent[];
+			try { subEntries = readdirSync(datePath, { withFileTypes: true }); } catch { continue; }
+			for (const sub of subEntries) {
+				if (!sub.isDirectory()) continue;
+				const filePath = join(datePath, sub.name, "artifact.json");
+				if (!existsSync(filePath)) continue;
+				try {
+					const raw = readFileSync(filePath, "utf-8");
+					const a = JSON.parse(raw) as Artifact;
+					if (!seen.has(a.id)) { seen.add(a.id); artifacts.push(a); }
+				} catch { /* skip corrupt */ }
+			}
+		} else {
+			// Old-style flat dir: artifacts/slug/artifact.json
+			const filePath = join(ARTIFACTS_DIR, entry.name, "artifact.json");
+			if (!existsSync(filePath)) continue;
+			try {
+				const raw = readFileSync(filePath, "utf-8");
+				const a = JSON.parse(raw) as Artifact;
+				if (!seen.has(a.id)) { seen.add(a.id); artifacts.push(a); }
+			} catch { /* skip corrupt */ }
 		}
 	}
 	return artifacts.sort((a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime());
@@ -229,6 +286,7 @@ export function persistState(pi: ExtensionAPI, state: ADAState): void {
 /**
  * Clean up artifact subfolders older than maxAgeDays.
  * Only removes artifacts not updated within the cutoff.
+ * Also removes empty date directories after cleanup.
  */
 export function cleanupOldArtifacts(maxAgeDays: number = 7): number {
 	const cutoff = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
@@ -245,5 +303,17 @@ export function cleanupOldArtifacts(maxAgeDays: number = 7): number {
 			}
 		}
 	}
+	// Remove empty date directories left behind after cleanup
+	try {
+		const entries = readdirSync(ARTIFACTS_DIR, { withFileTypes: true });
+		for (const entry of entries) {
+			if (!entry.isDirectory() || !/^\d{8}$/.test(entry.name)) continue;
+			const datePath = join(ARTIFACTS_DIR, entry.name);
+			try {
+				const contents = readdirSync(datePath);
+				if (contents.length === 0) rmSync(datePath, { recursive: true, force: true });
+			} catch { /* ignore */ }
+		}
+	} catch { /* ignore */ }
 	return cleaned;
 }

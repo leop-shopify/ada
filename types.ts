@@ -6,7 +6,8 @@
  * The data section is free-form — the agent structures it however the work demands.
  *
  * Storage layout:
- *   ~/.pi/agent/artifacts/{slug}/artifact.json
+ *   New: ~/.pi/agent/artifacts/{yyyymmdd}/{slug}/artifact.json
+ *   Legacy: ~/.pi/agent/artifacts/{slug}/artifact.json (still supported for reads)
  */
 
 /** High-level artifact category for prompt context. */

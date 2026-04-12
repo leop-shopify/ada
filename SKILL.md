@@ -53,9 +53,11 @@ There is no ada_close. Artifacts do not close. To switch, use /ada-resume.
 
 ## The artifact folder
 
-Each artifact lives in its own folder:
+Each artifact lives in its own date-organized folder:
 
-    ~/.pi/agent/artifacts/{slug}/artifact.json
+    ~/.pi/agent/artifacts/{yyyymmdd}/{slug}/artifact.json
+
+Legacy artifacts at `~/.pi/agent/artifacts/{slug}/` are still read transparently.
 
 You can write any file into this folder using the standard `write` tool. Reference
 documents, research notes, interview transcripts, evidence files, exported data --

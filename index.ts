@@ -24,10 +24,10 @@ import {
 	readArtifactFromDisk,
 	writeArtifactToDisk,
 	persistState,
+	artifactDir,
 } from "./helpers.js";
 import { registerTools } from "./tools.js";
 import type { ADAState, Artifact } from "./types.js";
-import { ARTIFACTS_DIR } from "./types.js";
 
 /** Tool names considered "substantive" for nudge heuristic. */
 const SUBSTANTIVE_TOOLS = new Set([
@@ -196,52 +196,89 @@ Use ada_get with specific key names above to load data when needed.`,
 		};
 	});
 
-	// ─── /artifact Command ──────────────────────────────────────────
-
-	pi.registerCommand("ada-list", {
-		description: "List all ADA artifacts",
-		handler: async (_args, ctx) => {
-			const all = listArtifactsFromDisk();
-			if (all.length === 0) {
-				ctx.ui.notify("No artifacts found.", "info");
-				return;
-			}
-			const currentId = state.artifact?.id;
-			const lines = all.map((a) => {
-				const active = a.id === currentId ? " [current]" : "";
-				const age = timeSince(new Date(a.updated_at));
-				const dataKeys = Object.keys(a.data ?? {});
-				const cpCount = (a.checkpoints ?? []).length;
-				const lastCp = cpCount > 0 ? a.checkpoints[cpCount - 1].note.slice(0, 60) : "";
-				return `${a.title} (${a.type}) -- ${dataKeys.length} keys, ${cpCount} cp -- ${age} ago${active}\n  ${lastCp ? `last: ${lastCp}\n  ` : ""}id: ${a.id}`;
-			});
-			ctx.ui.notify(lines.join("\n\n"), "info");
-		},
-	});
+	// ─── /ada-resume Command ─────────────────────────────────────────
 
 	pi.registerCommand("ada-resume", {
-		description: "Resume an ADA artifact by ID or interactive picker",
+		description: "Resume an ADA artifact by ID, interactive picker, or search (use / to search)",
 		handler: async (args, ctx) => {
 			let id = (args ?? "").trim();
 
-			// No ID provided -- show interactive picker
+			// "/" or "search" jumps straight to search mode
+			const isSearchMode = id === "/" || id.toLowerCase() === "search";
+			if (isSearchMode) id = "";
+
+			// No ID provided -- show interactive picker with pagination + search
 			if (!id) {
 				const all = listArtifactsFromDisk();
 				const currentId = state.artifact?.id;
-				const resumable = all.filter((a) => a.id !== currentId);
-				if (resumable.length === 0) {
+				let pool = all.filter((a) => a.id !== currentId);
+				if (pool.length === 0) {
 					ctx.ui.notify("No other artifacts to resume.", "info");
 					return;
 				}
-				const options = resumable.map((a) => {
-					const age = timeSince(new Date(a.updated_at));
-					return `${a.title} (${Object.keys(a.data ?? {}).length} keys, ${age} ago) -- ${a.id}`;
-				});
-				const choice = await ctx.ui.select("Resume artifact:", options);
-				if (!choice) return;
-				const match = choice.match(/-- (.+)$/);
-				if (!match) return;
-				id = match[1];
+
+				const PAGE_SIZE = 20;
+				let page = 0;
+				let searchTerm = "";
+
+				// If launched with "/" or "search", prompt for search immediately
+				if (isSearchMode) {
+					const term = await ctx.ui.input("Search artifacts:", "title, id, or type");
+					if (!term) return;
+					searchTerm = term;
+				}
+
+				picker: while (true) {
+					const filtered = searchTerm
+						? pool.filter((a) => {
+								const hay = `${a.title} ${a.id} ${a.type}`.toLowerCase();
+								return hay.includes(searchTerm.toLowerCase());
+							})
+						: pool;
+
+					if (filtered.length === 0) {
+						ctx.ui.notify(`No artifacts matching "${searchTerm}".`, "info");
+						searchTerm = "";
+						page = 0;
+						continue;
+					}
+
+					const totalPages = Math.ceil(filtered.length / PAGE_SIZE);
+					if (page >= totalPages) page = totalPages - 1;
+					const start = page * PAGE_SIZE;
+					const slice = filtered.slice(start, start + PAGE_SIZE);
+
+					const options: string[] = [];
+					// Search/clear at the top for quick access
+					options.push(searchTerm ? `[x] Clear search ("${searchTerm}")` : "[/] Search...");
+					if (page > 0) options.push("<< Previous page");
+					for (const a of slice) {
+						const age = timeSince(new Date(a.updated_at));
+						options.push(`${a.title} (${Object.keys(a.data ?? {}).length} keys, ${age} ago) -- ${a.id}`);
+					}
+					if (page < totalPages - 1) options.push(">> Next page");
+
+					const label = searchTerm
+						? `Resume artifact ("${searchTerm}", ${filtered.length} matches, page ${page + 1}/${totalPages}):`
+						: `Resume artifact (${filtered.length} total, page ${page + 1}/${totalPages}):`;
+
+					const choice = await ctx.ui.select(label, options);
+					if (!choice) return;
+
+					if (choice === "<< Previous page") { page--; continue; }
+					if (choice === ">> Next page") { page++; continue; }
+					if (choice.startsWith("[x] Clear search")) { searchTerm = ""; page = 0; continue; }
+					if (choice === "[/] Search...") {
+						const term = await ctx.ui.input("Search artifacts:", "title, id, or type");
+						if (term) { searchTerm = term; page = 0; }
+						continue;
+					}
+
+					const match = choice.match(/-- (.+)$/);
+					if (!match) return;
+					id = match[1];
+					break picker;
+				}
 			}
 
 			const artifact = readArtifactFromDisk(id);
@@ -289,6 +326,137 @@ Use ada_get with specific key names above to load data when needed.`,
 		},
 	});
 
+	// ─── /ada-inspect Command ────────────────────────────────────────
+
+	pi.registerCommand("ada-inspect", {
+		description: "Open a visual artifact inspector in the browser",
+		handler: async (args, ctx) => {
+			const { readFileSync, writeFileSync } = await import("node:fs");
+			const { join, dirname } = await import("node:path");
+			const { fileURLToPath } = await import("node:url");
+			const { execSync } = await import("node:child_process");
+
+			// Determine which artifact to inspect
+			let targetId = (args ?? "").trim();
+
+			if (!targetId && state.artifact) {
+				targetId = state.artifact.id;
+			}
+
+			if (!targetId) {
+				// Show interactive picker with pagination + search
+				const all = listArtifactsFromDisk();
+				if (all.length === 0) {
+					ctx.ui.notify("No artifacts to inspect.", "info");
+					return;
+				}
+
+				const PAGE_SIZE = 20;
+				let page = 0;
+				let searchTerm = "";
+
+				picker: while (true) {
+					const filtered = searchTerm
+						? all.filter((a) => {
+								const hay = `${a.title} ${a.id} ${a.type}`.toLowerCase();
+								return hay.includes(searchTerm.toLowerCase());
+							})
+						: all;
+
+					if (filtered.length === 0) {
+						ctx.ui.notify(`No artifacts matching "${searchTerm}".`, "info");
+						searchTerm = "";
+						page = 0;
+						continue;
+					}
+
+					const totalPages = Math.ceil(filtered.length / PAGE_SIZE);
+					if (page >= totalPages) page = totalPages - 1;
+					const start = page * PAGE_SIZE;
+					const slice = filtered.slice(start, start + PAGE_SIZE);
+
+					const options: string[] = [];
+					// Search/clear at the top for quick access
+					options.push(searchTerm ? `[x] Clear search ("${searchTerm}")` : "[/] Search...");
+					if (page > 0) options.push("<< Previous page");
+					for (const a of slice) {
+						const age = timeSince(new Date(a.updated_at));
+						const cpCount = (a.checkpoints ?? []).length;
+						options.push(`${a.title} (${cpCount} cp, ${age} ago) -- ${a.id}`);
+					}
+					if (page < totalPages - 1) options.push(">> Next page");
+
+					const label = searchTerm
+						? `Inspect artifact ("${searchTerm}", ${filtered.length} matches, page ${page + 1}/${totalPages}):`
+						: `Inspect artifact (${filtered.length} total, page ${page + 1}/${totalPages}):`;
+
+					const choice = await ctx.ui.select(label, options);
+					if (!choice) return;
+
+					if (choice === "<< Previous page") { page--; continue; }
+					if (choice === ">> Next page") { page++; continue; }
+					if (choice.startsWith("[x] Clear search")) { searchTerm = ""; page = 0; continue; }
+					if (choice === "[/] Search...") {
+						const term = await ctx.ui.input("Search artifacts:", "title, id, or type");
+						if (term) { searchTerm = term; page = 0; }
+						continue;
+					}
+
+					const match = choice.match(/-- (.+)$/);
+					if (!match) return;
+					targetId = match[1];
+					break picker;
+				}
+			}
+
+			const artifact = readArtifactFromDisk(targetId);
+			if (!artifact) {
+				ctx.ui.notify(`Artifact not found: ${targetId}`, "error");
+				return;
+			}
+
+			// Collect sibling artifact summaries (lightweight -- just id, title, updated_at, type)
+			const allArtifacts = listArtifactsFromDisk();
+			const siblings = allArtifacts
+				.map((a) => ({ id: a.id, title: a.title, updated_at: a.updated_at, type: a.type }))
+				.sort((a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime());
+
+			// Read the HTML template
+			const extDir = dirname(fileURLToPath(import.meta.url));
+			const templatePath = join(extDir, "inspect.html");
+			let html = readFileSync(templatePath, "utf-8");
+
+			// Inject artifact data before the closing </script> tag
+			// Escape </ sequences to prevent XSS breakout from artifact data containing </script>
+			const safeJson = (obj: unknown) => JSON.stringify(obj).replace(/<\//g, "<\\/");
+			const injection = `\nwindow.__ADA_ARTIFACT__ = ${safeJson(artifact)};\n` +
+				`window.__ADA_SIBLINGS__ = ${safeJson(siblings)};\n`;
+			html = html.replace(
+				"// \u2500\u2500 Inline data injection (used by ada-inspect command) \u2500\u2500",
+				"// \u2500\u2500 Inline data injection (used by ada-inspect command) \u2500\u2500\n" + injection,
+			);
+
+			// Write to artifact folder and open in browser
+			const outPath = join(artifactDir(targetId), "inspect.html");
+			writeFileSync(outPath, html, "utf-8");
+
+			try {
+				execSync(`open "${outPath}"`);
+			} catch {
+				// Fallback for Linux
+				try { execSync(`xdg-open "${outPath}"`); } catch { /* ignore */ }
+			}
+
+			const cpCount = (artifact.checkpoints ?? []).length;
+			const keyCount = Object.keys(artifact.data ?? {}).length;
+			ctx.ui.notify(
+				`Inspecting: "${artifact.title}" (${keyCount} keys, ${cpCount} checkpoints)\n` +
+				`Opened: ${outPath}`,
+				"info",
+			);
+		},
+	});
+
 	// ─── Artifact Injection into team_spawn ────────────────────────
 	// When the lead spawns a teammate while an artifact is active, append
 	// the artifact ID to the task so the spawned agent auto-connects.
@@ -303,7 +471,7 @@ Use ada_get with specific key names above to load data when needed.`,
 		if (!input.task) return;
 
 		const artifactId = state.artifact.id;
-		const dir = `${ARTIFACTS_DIR}/${artifactId}`;
+		const dir = artifactDir(artifactId);
 		const dataKeys = Object.keys(state.artifact.data);
 		const keysInfo = dataKeys.length > 0
 			? `\nAvailable data keys: ${dataKeys.join(", ")}`

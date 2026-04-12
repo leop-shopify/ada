@@ -18,7 +18,7 @@ Each artifact has two parts:
 
 **checkpoints** -- milestones that mark meaningful progress. Not a journal. Just the moments that matter: "baseline measured", "root cause found", "3/8 interviews complete".
 
-Artifacts live on disk at `~/.pi/agent/artifacts/{slug}/artifact.json`. Each artifact gets its own folder where agents can also store reference files (evidence, drafts, exported data) alongside the main JSON.
+Artifacts live on disk at `~/.pi/agent/artifacts/{yyyymmdd}/{slug}/artifact.json`, organized by creation date. Each artifact gets its own folder where agents can also store reference files (evidence, drafts, exported data) alongside the main JSON. Legacy artifacts at the old flat path (`artifacts/{slug}/`) are read transparently for backward compatibility.
 
 ### Context Management
 
@@ -64,15 +64,14 @@ Pi loads extensions from `~/.pi/agent/extensions/` automatically. No configurati
 | `ada_get` | Targeted read. Pass specific keys to get just those, or no keys to get the header (available keys, checkpoints). Spawned agents pass an `id` to connect. |
 | `ada_read` | Full load. Returns everything. Use when resuming or when the complete picture is needed. Expensive on context. |
 | `ada_checkpoint` | Mark a milestone. One sentence about what was reached. |
-| `ada_close` | Close as `completed` (done) or `paused` (resume later). Optionally include a summary. |
-
 ## Slash Commands
 
 | Command | What it does |
 |---------|--------------|
-| `/ada-list` | List all artifacts with status, data keys, and last checkpoint |
-| `/ada-resume` | Interactive picker to resume a paused or completed artifact |
-| `/ada-resume <id>` | Connect to a specific artifact by ID, rebinding session ownership |
+| `/ada-resume` | Interactive picker to resume another artifact |
+| `/ada-resume <id>` | Connect to a specific artifact by ID |
+| `/ada-inspect` | Open a visual artifact inspector in the browser (interactive picker if no artifact is active) |
+| `/ada-inspect <id>` | Inspect a specific artifact by ID |
 
 ## Multi-Agent Support
 

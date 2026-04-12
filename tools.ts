@@ -14,7 +14,6 @@ import {
 	acquireLock, releaseLock, findSimilarArtifacts, listArtifactsFromDisk,
 } from "./helpers.js";
 import type { ADAState, Artifact, ArtifactType, Checkpoint } from "./types.js";
-import { ARTIFACTS_DIR } from "./types.js";
 
 export function registerTools(
 	pi: ExtensionAPI,
@@ -135,10 +134,11 @@ export function registerTools(
 			writeArtifactToDisk(artifact);
 			persistState(pi, state);
 
+			const artDir = artifactDir(artifact.id);
 			return {
 				content: [{
 					type: "text",
-					text: `Artifact created: "${artifact.title}" (${artifact.id})\nType: ${artifact.type}\nPath: ${ARTIFACTS_DIR}/${artifact.id}/artifact.json`,
+					text: `Artifact created: "${artifact.title}" (${artifact.id})\nType: ${artifact.type}\nPath: ${artDir}/artifact.json`,
 				}],
 				details: { artifact },
 			};
@@ -285,9 +285,18 @@ export function registerTools(
 				};
 			}
 
+			// Spawned agents prepend their name so the lead knows who wrote each checkpoint
+			let note = params.note as string;
+			if (isSpawnedAgent) {
+				const agentName = process.env.PI_TEAM_AGENT_NAME;
+				if (agentName) {
+					note = `[@${agentName}] ${note}`;
+				}
+			}
+
 			const checkpoint: Checkpoint = {
 				timestamp: new Date().toISOString(),
-				note: params.note as string,
+				note,
 			};
 
 			await acquireLock(state.artifact.id);
