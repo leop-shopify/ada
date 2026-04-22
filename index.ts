@@ -18,6 +18,7 @@
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { truncateToWidth } from "@mariozechner/pi-tui";
 import {
 	cleanupOldArtifacts,
 	listArtifactsFromDisk,
@@ -25,6 +26,10 @@ import {
 	writeArtifactToDisk,
 	persistState,
 	artifactDir,
+	jewelryForComplexity,
+	formatSize,
+	getArtifactFileSize,
+	timeSince as timeSinceDate,
 } from "./helpers.js";
 import { registerTools } from "./tools.js";
 import type { ADAState, Artifact } from "./types.js";
@@ -42,6 +47,8 @@ const SUBSTANTIVE_TOOLS = new Set([
 /** Minimum substantive tool calls before nudging. */
 const NUDGE_THRESHOLD = 2;
 
+const ADA_WIDGET_KEY = "ada-artifact-banner";
+
 export default function adaExtension(pi: ExtensionAPI): void {
 	// ─── Spawned Agent Detection ───────────────────────────────────
 	// Spawned agents can only read/update artifacts. Never create.
@@ -55,12 +62,54 @@ export default function adaExtension(pi: ExtensionAPI): void {
 		toolCallsThisTurn: 0,
 	};
 
+	let currentCtx: ExtensionContext | null = null;
+
+	// ─── Artifact Banner (widget above editor) ───────────────────────
+	// Shows:
+	//   ─────────────────────────────────────────────
+	//     <jewelry>  │  <title>  │  <size>  │  <updated>
+	//   ─────────────────────────────────────────────
+
+	function updateBanner(ctx?: ExtensionContext): void {
+		const c = ctx ?? currentCtx;
+		if (!c?.hasUI) return;
+
+		if (!state.artifact) {
+			c.ui.setWidget(ADA_WIDGET_KEY, undefined);
+			return;
+		}
+
+		const a = state.artifact;
+		const dataKeys = Object.keys(a.data).length;
+		const cpCount = a.checkpoints.length;
+		const jewelry = jewelryForComplexity(dataKeys, cpCount);
+		const size = formatSize(getArtifactFileSize(a.id));
+		const updated = timeSinceDate(new Date(a.updated_at));
+
+		c.ui.setWidget(ADA_WIDGET_KEY, (_tui, theme) => {
+			return {
+				render: (width: number) => {
+					const sep = theme.fg("dim", " │ ");
+					const content =
+						`  ${jewelry} ` + sep +
+						theme.fg("accent", theme.bold(a.title)) + sep +
+						theme.fg("muted", size) + sep +
+						theme.fg("muted", updated);
+					const bar = theme.fg("dim", "─".repeat(width));
+					return [bar, truncateToWidth(content, width), bar];
+				},
+				invalidate: () => {},
+			};
+		});
+	}
+
 	// ─── State Restoration ──────────────────────────────────────────
 
 	function restoreState(ctx: ExtensionContext): void {
 		state.artifact = null;
 		state.artifactUpdatedThisTurn = false;
 		state.toolCallsThisTurn = 0;
+		currentCtx = ctx;
 
 		// Restore from session branch. Artifacts are shared — no session binding.
 		for (const entry of ctx.sessionManager.getBranch()) {
@@ -86,6 +135,9 @@ export default function adaExtension(pi: ExtensionAPI): void {
 
 		// Auto-cleanup old artifacts on session start
 		cleanupOldArtifacts(7);
+
+		// Show or hide status bar based on restored state
+		updateBanner(ctx);
 	}
 
 	// ─── Session Events ─────────────────────────────────────────────
@@ -94,6 +146,10 @@ export default function adaExtension(pi: ExtensionAPI): void {
 	pi.on("session_switch", async (_event, ctx) => restoreState(ctx));
 	pi.on("session_fork", async (_event, ctx) => restoreState(ctx));
 	pi.on("session_tree", async (_event, ctx) => restoreState(ctx));
+
+	pi.on("agent_start", async (_event, ctx) => {
+		currentCtx = ctx;
+	});
 
 	// ─── System Prompt Injection ────────────────────────────────────
 
@@ -150,6 +206,7 @@ Use ada_get with specific key names above to load data when needed.`,
 			event.toolName === "ada_checkpoint"
 		) {
 			state.artifactUpdatedThisTurn = true;
+			updateBanner();
 		} else if (SUBSTANTIVE_TOOLS.has(event.toolName)) {
 			state.toolCallsThisTurn++;
 		}
@@ -301,6 +358,7 @@ Use ada_get with specific key names above to load data when needed.`,
 			const dataKeys = Object.keys(artifact.data ?? {});
 			const cpCount = (artifact.checkpoints ?? []).length;
 			ctx.ui.notify(`Resumed: "${artifact.title}" (${dataKeys.length} keys, ${cpCount} checkpoints)`, "info");
+			updateBanner(ctx);
 
 			// Inject a context message with the keys so the agent knows what data
 			// is available without having to call ada_get(header) first.

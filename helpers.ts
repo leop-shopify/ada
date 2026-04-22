@@ -13,6 +13,55 @@ import { join } from "node:path";
 import type { ADAState, Artifact } from "./types.js";
 import { ARTIFACTS_DIR } from "./types.js";
 
+// ─── Jewelry Tiers ──────────────────────────────────────────────────
+// Complexity = data keys + checkpoints. More complex artifacts get fancier gems.
+
+const JEWELRY_TIERS = [
+	{ emoji: "\u{1FAA8}", min: 0 },   // rock
+	{ emoji: "\u{1F52E}", min: 5 },   // crystal ball
+	{ emoji: "\u{1F48E}", min: 15 },  // gem stone
+	{ emoji: "\u{2B50}", min: 30 },   // star (legendary)
+] as const;
+
+/** Pick a jewelry emoji based on artifact complexity (keys + checkpoints). */
+export function jewelryForComplexity(dataKeys: number, checkpoints: number): string {
+	const complexity = dataKeys + checkpoints;
+	let emoji = JEWELRY_TIERS[0].emoji;
+	for (const tier of JEWELRY_TIERS) {
+		if (complexity >= tier.min) emoji = tier.emoji;
+	}
+	return emoji;
+}
+
+/** Format bytes into human-readable size (B, KB, MB). */
+export function formatSize(bytes: number): string {
+	if (bytes < 1024) return `${bytes}B`;
+	if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
+	return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
+}
+
+/** Get artifact.json file size in bytes. Returns 0 if not found. */
+export function getArtifactFileSize(id: string): number {
+	const filePath = artifactFilePath(id);
+	try {
+		return statSync(filePath).size;
+	} catch {
+		return 0;
+	}
+}
+
+/** Relative time since a date, compact format. */
+export function timeSince(date: Date): string {
+	const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
+	if (seconds < 60) return `${seconds}s ago`;
+	const minutes = Math.floor(seconds / 60);
+	if (minutes < 60) return `${minutes}m ago`;
+	const hours = Math.floor(minutes / 60);
+	if (hours < 24) return `${hours}h ago`;
+	const days = Math.floor(hours / 24);
+	return `${days}d ago`;
+}
+
 // ─── File Locking ───────────────────────────────────────────────────
 // Simple lockfile-based mutex for concurrent artifact writes.
 // Agents wait and retry until the lock is available.
