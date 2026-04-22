@@ -1,3 +1,8 @@
+---
+name: ada
+description: "ADA - Artifact Driven Agent. Persistent structured JSON artifacts for iterative multi-step work. Tracks investigations, bug fixes, code reviews, planning sessions. Shared across sessions and agent boundaries."
+---
+
 # ADA -- Artifact Driven Agent
 
 ADA gives you a persistent, structured workspace for any multi-step work. The artifact
