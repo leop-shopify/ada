@@ -10,7 +10,7 @@ import {
 	jewelryForComplexity,
 	formatSize,
 	timeSince,
-	slugify,
+	recordArtifactTurn,
 } from "./helpers.js";
 import { registerTools } from "./tools.js";
 import { loadSettings, registerSettingsCommand } from "./settings.js";
@@ -19,9 +19,10 @@ import {
 	spawnSetMeta,
 	spawnCleanupOld,
 	spawnResponseParser,
-	lastAssistantText,
+	turnExtractionPayload,
 } from "./subprocess.js";
 import { registerSoftRestart, registerCompactCommand } from "./compaction.js";
+import { injectAdaContextIntoDelegation, isSpawnedAgentEnv } from "./delegation.js";
 import type { ADAState, Artifact } from "./types.js";
 
 const ADA_WIDGET_KEY = "ada-artifact-banner";
@@ -29,8 +30,7 @@ const ADA_WIDGET_KEY = "ada-artifact-banner";
 export default function adaExtension(pi: ExtensionAPI): void {
 	if (process.env.ADA_SUBPROCESS === "1") return;
 
-	const isSpawnedAgent = process.env.PI_AGENT_ROLE === "subagent" ||
-		process.env.PI_TEAM_NAME !== undefined;
+	const isSpawnedAgent = isSpawnedAgentEnv(process.env);
 
 	const state: ADAState = {
 		artifact: null,
@@ -124,7 +124,8 @@ export default function adaExtension(pi: ExtensionAPI): void {
 	}
 
 	function restoreState(ctx: ExtensionContext): void {
-		state.artifact = null;
+		const previousId = state.artifact?.id ?? null;
+		let restored: Artifact | null = null;
 		state.inputOverCap = false;
 		currentCtx = ctx;
 		firstTurnDone = false;
@@ -133,11 +134,7 @@ export default function adaExtension(pi: ExtensionAPI): void {
 		for (const entry of ctx.sessionManager.getBranch()) {
 			if (entry.type === "custom" && entry.customType === "ada-artifact") {
 				const data = entry.data as { artifact?: { id: string } } | undefined;
-				if (data?.artifact) {
-					state.artifact = readArtifactFromDisk(data.artifact.id);
-				} else {
-					state.artifact = null;
-				}
+				if (data?.artifact) restored = readArtifactFromDisk(data.artifact.id);
 			}
 			if (
 				entry.type === "message" &&
@@ -146,8 +143,14 @@ export default function adaExtension(pi: ExtensionAPI): void {
 				entry.message.details?.artifact
 			) {
 				const a = entry.message.details.artifact as Artifact;
-				state.artifact = readArtifactFromDisk(a.id);
+				restored = readArtifactFromDisk(a.id);
 			}
+		}
+
+		if (restored) {
+			state.artifact = restored;
+		} else if (previousId) {
+			state.artifact = readArtifactFromDisk(previousId) ?? state.artifact;
 		}
 
 		spawnCleanupOld(7);
@@ -192,14 +195,8 @@ export default function adaExtension(pi: ExtensionAPI): void {
 		}
 
 		if (!state.artifact && !isSpawnedAgent) {
-			const seed = userInput
-				.slice(0, 60)
-				.replace(/\n/g, " ")
-				.replace(/[^a-zA-Z0-9 _\-]/g, "")
-				.trim() || "artifact";
-			const slug = slugify(seed) || `artifact-${Date.now().toString(36)}`;
-			const title = slug;
-			const id = slug;
+			const id = `tmp-${Date.now()}`;
+			const title = id;
 			const now = new Date();
 			const tzOffset = -now.getTimezoneOffset();
 			const tzH = String(Math.floor(Math.abs(tzOffset) / 60)).padStart(2, "0");
@@ -224,9 +221,11 @@ export default function adaExtension(pi: ExtensionAPI): void {
 			attachWatcher();
 		}
 
-		if (state.artifact && userInput && !isSpawnedAgent) {
-			spawnTrackInput(state.artifact.id, state.artifact.title, userInput);
+		if (state.artifact && !isSpawnedAgent) {
+			spawnTrackInput(state.artifact.id, state.artifact.title, "");
 		}
+
+		if (isSpawnedAgent) return;
 
 		refreshFromDisk();
 		attachWatcher();
@@ -278,12 +277,25 @@ export default function adaExtension(pi: ExtensionAPI): void {
 			}
 		}
 
-		const settings = getSettings();
-		if (settings.command_enabled && settings.command.trim() && event.messages?.length) {
-			const assistant = lastAssistantText(event.messages);
-			if (assistant) {
-				spawnResponseParser(state.artifact, assistant, settings.command);
+		const payload = event.messages?.length ? turnExtractionPayload(event.messages) : "";
+		if (payload) {
+			const recorded = await recordArtifactTurn(state.artifact.id, payload);
+			if (recorded) {
+				state.artifact = recorded;
+				persistState(pi, state);
+				attachWatcher();
+				updateBanner();
 			}
+		}
+
+		const settings = getSettings();
+		if (settings.command_enabled && settings.command.trim() && payload && state.artifact) {
+			spawnResponseParser(state.artifact, payload, settings.command, (artifact) => {
+				state.artifact = artifact;
+				persistState(pi, state);
+				attachWatcher();
+				updateBanner();
+			});
 		}
 	});
 
@@ -299,26 +311,15 @@ export default function adaExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("tool_call", async (event) => {
-		if (event.toolName !== "team_spawn") return;
 		if (!state.artifact) return;
 		if (isSpawnedAgent) return;
 
-		const input = event.input as { task?: string };
-		if (!input.task) return;
-
-		const artifactId = state.artifact.id;
-		const dir = artifactDir(artifactId);
-		const dataKeys = Object.keys(state.artifact.data);
-		const keysInfo = dataKeys.length > 0
-			? `\nAvailable data keys: ${dataKeys.join(", ")}`
-			: "";
-
-		input.task += `\n\nActive ADA artifact: ${artifactId}\n` +
-			`Artifact folder: ${dir}/\n` +
-			`Use ada_get with id="${artifactId}" to connect, then ada_get with specific keys to load what you need. ` +
-			`Artifacts are read-only from agents. ada_create, ada_update, and ada_checkpoint do not exist. ` +
-			`Just do the work and report back; the artifact reflects what happened.` +
-			keysInfo;
+		injectAdaContextIntoDelegation(
+			event.toolName,
+			event.input,
+			state.artifact,
+			artifactDir(state.artifact.id),
+		);
 	});
 
 	registerAdaResumeCommand(pi, state, updateBanner, attachWatcher);

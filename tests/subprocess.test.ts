@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildExtractPrompt, buildResponseParserArgv, lastAssistantText } from "../subprocess.js";
+import { buildExtractPrompt, buildResponseParserArgv, turnExtractionPayload } from "../subprocess.js";
 import type { Artifact } from "../types.js";
 
 function makeArtifact(id = "art-1"): Artifact {
@@ -17,14 +17,14 @@ function makeArtifact(id = "art-1"): Artifact {
 	};
 }
 
-describe("lastAssistantText", () => {
+describe("turnExtractionPayload", () => {
 	it("returns empty string when there are no assistant messages", () => {
-		expect(lastAssistantText([])).toBe("");
-		expect(lastAssistantText([{ role: "user", content: "hi" }])).toBe("");
+		expect(turnExtractionPayload([])).toBe("");
+		expect(turnExtractionPayload([{ role: "user", content: "hi" }])).toBe("");
 	});
 
 	it("returns the last assistant message text", () => {
-		const out = lastAssistantText([
+		const out = turnExtractionPayload([
 			{ role: "user", content: "go" },
 			{ role: "assistant", content: "first" },
 			{ role: "user", content: "again" },
@@ -34,21 +34,21 @@ describe("lastAssistantText", () => {
 	});
 
 	it("flattens visible thinking and text blocks", () => {
-		const out = lastAssistantText([
+		const out = turnExtractionPayload([
 			{ role: "assistant", content: [{ type: "thinking", thinking: "thinking 1" }, { type: "text", text: "line 1" }, { type: "text", text: "line 2" }, { type: "tool_use" }] },
 		]);
 		expect(out).toBe("[thinking]\nthinking 1\n\n[assistant]\nline 1\n\n[assistant]\nline 2");
 	});
 
 	it("includes communicate tool call messages without tool call noise", () => {
-		const out = lastAssistantText([
+		const out = turnExtractionPayload([
 			{ role: "assistant", content: [{ type: "toolCall", name: "communicate", arguments: { message: "visible response" } }] },
 		]);
 		expect(out).toBe("[assistant_message]\nvisible response");
 	});
 
 	it("includes tool results", () => {
-		const out = lastAssistantText([
+		const out = turnExtractionPayload([
 			{ role: "assistant", content: "before tools" },
 			{ role: "toolUse", content: "ignored" },
 			{ role: "toolResult", toolName: "bash", content: "command output" },
@@ -56,8 +56,61 @@ describe("lastAssistantText", () => {
 		expect(out).toBe("before tools\n\n[tool_result:bash]\ncommand output");
 	});
 
+	it("handles Pi-shaped tool result content arrays without assistant labels", () => {
+		const out = turnExtractionPayload([
+			{ role: "toolResult", toolName: "read", content: [{ type: "text", text: "fetched data" }] },
+		]);
+		expect(out).toBe("[tool_result:read]\nfetched data");
+		expect(out).not.toContain("[assistant]");
+	});
+
+	it("includes tool result details", () => {
+		const out = turnExtractionPayload([
+			{ role: "toolResult", toolName: "bash", content: "short output", details: { truncation: { truncated: true }, fullOutputPath: "/path/full.log" } },
+		]);
+		expect(out).toContain("[tool_result:bash]\nshort output");
+		expect(out).toContain("[tool_result_details:bash]");
+		expect(out).toContain('"truncated": true');
+		expect(out).toContain('"fullOutputPath": "/path/full.log"');
+	});
+
+	it("keeps fetched data omitted from final prose", () => {
+		const out = turnExtractionPayload([
+			{ role: "assistant", content: [{ type: "toolCall", name: "read", arguments: { path: "facts.txt" } }] },
+			{ role: "toolResult", toolName: "read", content: [{ type: "text", text: "secret fact: checkout_token=abc" }] },
+			{ role: "assistant", content: [{ type: "text", text: "I checked the file." }] },
+		]);
+		expect(out).toContain("[tool_call:read]");
+		expect(out).toContain("secret fact: checkout_token=abc");
+		expect(out).toContain("[assistant]\nI checked the file.");
+	});
+
+	it("keeps thinking, tool calls, tool results, and final text in one turn", () => {
+		const out = turnExtractionPayload([
+			{ role: "assistant", content: [
+				{ type: "thinking", thinking: "maybe query observe" },
+				{ type: "toolCall", name: "observe_query", arguments: { query: "errors" } },
+			] },
+			{ role: "toolResult", toolName: "observe_query", content: [{ type: "text", text: "5 errors" }] },
+			{ role: "assistant", content: [{ type: "text", text: "Found errors." }] },
+		]);
+		expect(out).toContain("[thinking]\nmaybe query observe");
+		expect(out).toContain("[tool_call:observe_query]");
+		expect(out).toContain("[tool_result:observe_query]\n5 errors");
+		expect(out).toContain("[assistant]\nFound errors.");
+	});
+
+	it("keeps long tool results beyond the old 4000 character boundary", () => {
+		const longResult = "x".repeat(10_000);
+		const out = turnExtractionPayload([
+			{ role: "toolResult", toolName: "read", content: [{ type: "text", text: longResult }] },
+		]);
+		expect(out).toContain("x".repeat(8_000));
+		expect(out).not.toContain("[truncated]");
+	});
+
 	it("drops ADA and memory-bank context noise", () => {
-		const out = lastAssistantText([
+		const out = turnExtractionPayload([
 			{ role: "user", content: "go" },
 			{ role: "assistant", content: [
 				{ type: "text", text: "[BACKGROUND STATE -- not the conversation topic]\nActive artifact: x\nUse ada_get with specific key names above to load data when needed." },

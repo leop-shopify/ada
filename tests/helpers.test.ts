@@ -10,7 +10,10 @@ import {
 	formatSize,
 	jewelryForComplexity,
 	listArtifactsFromDisk,
+	promoteTemporaryArtifact,
 	readArtifactFromDisk,
+	recordArtifactData,
+	recordArtifactTurn,
 	releaseLock,
 	slugify,
 	timeSince,
@@ -137,6 +140,82 @@ describe("writeArtifactToDisk + readArtifactFromDisk", () => {
 		mkdirSync(dir, { recursive: true });
 		writeFileSync(join(dir, "artifact.json"), "{not json", "utf-8");
 		expect(readArtifactFromDisk("corrupt-1")).toBeNull();
+	});
+});
+
+describe("promoteTemporaryArtifact", () => {
+	it("renames tmp id and folder after the title becomes meaningful", () => {
+		const a = makeArtifact("tmp-12345", { title: "ADA Extraction Fix" });
+		writeArtifactToDisk(a);
+		const oldDir = artifactDir("tmp-12345");
+
+		const promoted = promoteTemporaryArtifact("tmp-12345");
+
+		expect(promoted).not.toBeNull();
+		expect(promoted!.id).toBe("ada-extraction-fix-12345");
+		expect(existsSync(oldDir)).toBe(false);
+		expect(readArtifactFromDisk("tmp-12345")).toBeNull();
+		const renamed = readArtifactFromDisk("ada-extraction-fix-12345");
+		expect(renamed).not.toBeNull();
+		expect(renamed!.title).toBe("ADA Extraction Fix");
+	});
+
+	it("keeps tmp artifacts when the title is still temporary", () => {
+		writeArtifactToDisk(makeArtifact("tmp-67890", { title: "tmp-67890" }));
+
+		const promoted = promoteTemporaryArtifact("tmp-67890");
+
+		expect(promoted).not.toBeNull();
+		expect(promoted!.id).toBe("tmp-67890");
+		expect(readArtifactFromDisk("tmp-67890")).not.toBeNull();
+	});
+});
+
+describe("recordArtifactData", () => {
+	it("merges data and appends one checkpoint", async () => {
+		writeArtifactToDisk(makeArtifact("record-target", { data: { existing: true } }));
+
+		const recorded = await recordArtifactData("record-target", { todo: { id: 1, title: "delectus aut autem" } }, "Recorded JSONPlaceholder todo 1.");
+
+		expect(recorded).not.toBeNull();
+		expect(recorded!.data.existing).toBe(true);
+		expect(recorded!.data.todo).toEqual({ id: 1, title: "delectus aut autem" });
+		expect(recorded!.checkpoints).toHaveLength(1);
+		expect(recorded!.checkpoints[0].note).toBe("Recorded JSONPlaceholder todo 1.");
+		expect(recorded!.checkpoints[0].timestamp).toMatch(/[+-]\d{2}:\d{2}$/);
+		const back = readArtifactFromDisk("record-target");
+		expect(back!.data.todo).toEqual({ id: 1, title: "delectus aut autem" });
+	});
+
+	it("returns null for missing artifacts", async () => {
+		await expect(recordArtifactData("missing", { x: 1 }, "Missing.")).resolves.toBeNull();
+	});
+});
+
+describe("recordArtifactTurn", () => {
+	it("persists the assistant turn and appends a deterministic checkpoint", async () => {
+		writeArtifactToDisk(makeArtifact("turn-target"));
+
+		const recorded = await recordArtifactTurn("turn-target", "[assistant_message]\nFixed the parser and ran pnpm test.");
+
+		expect(recorded).not.toBeNull();
+		expect(recorded!.checkpoints).toHaveLength(1);
+		expect(recorded!.checkpoints[0].note).toBe("Captured assistant turn: Fixed the parser and ran pnpm test.");
+		expect(recorded!.data.turns).toEqual([
+			{
+				timestamp: recorded!.checkpoints[0].timestamp,
+				content: "[assistant_message]\nFixed the parser and ran pnpm test.",
+			},
+		]);
+	});
+
+	it("renames a temporary title from the first meaningful payload line", async () => {
+		writeArtifactToDisk(makeArtifact("tmp-111", { title: "tmp-111" }));
+
+		const recorded = await recordArtifactTurn("tmp-111", "[assistant_message]\nCheckpoint pipeline repair completed.");
+
+		expect(recorded).not.toBeNull();
+		expect(recorded!.title).toBe("Checkpoint pipeline repair completed.");
 	});
 });
 

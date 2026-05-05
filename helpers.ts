@@ -11,7 +11,7 @@ import {
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { ADAState, Artifact } from "./types.js";
 import { ADA_ROOT, ARTIFACTS_DIR } from "./types.js";
 
@@ -48,6 +48,14 @@ export function timeSince(date: Date): string {
 	if (hours < 24) return `${hours}h ago`;
 	const days = Math.floor(hours / 24);
 	return `${days}d ago`;
+}
+
+export function localIsoWithTz(date = new Date()): string {
+	const offset = -date.getTimezoneOffset();
+	const h = String(Math.floor(Math.abs(offset) / 60)).padStart(2, "0");
+	const m = String(Math.abs(offset) % 60).padStart(2, "0");
+	const sign = offset >= 0 ? "+" : "-";
+	return date.toISOString().replace("Z", `${sign}${h}:${m}`);
 }
 
 export function slugify(title: string): string {
@@ -216,6 +224,90 @@ export function writeArtifactToDisk(artifact: Artifact): void {
 	const tmpPath = `${filePath}.tmp`;
 	writeFileSync(tmpPath, finalJson, "utf-8");
 	renameSync(tmpPath, filePath);
+}
+
+export function promoteTemporaryArtifact(id: string): Artifact | null {
+	if (!/^tmp-\d+$/.test(id)) return readArtifactFromDisk(id);
+	const artifact = readArtifactFromDisk(id);
+	if (!artifact) return null;
+	const slug = slugify(artifact.title);
+	if (!slug || slug === id || /^tmp-\d+$/.test(slug)) return artifact;
+	const number = id.slice(4);
+	const nextId = `${slug}-${number}`;
+	if (nextId === id) return artifact;
+	const oldDir = artifactDir(id);
+	const newDir = join(dirname(oldDir), nextId);
+	if (!existsSync(newDir)) {
+		renameSync(oldDir, newDir);
+	}
+	artifact.id = nextId;
+	writeArtifactToDisk(artifact);
+	return artifact;
+}
+
+function payloadLines(payload: string): string[] {
+	return payload
+		.split(/\r?\n/)
+		.map((line) => line.trim())
+		.filter((line) => line && !/^\[[^\]]+\]$/.test(line) && !line.startsWith("[tool_result_meta:"));
+}
+
+function compactSentence(text: string, max = 180): string {
+	const oneLine = text.replace(/\s+/g, " ").trim();
+	if (oneLine.length <= max) return oneLine;
+	return `${oneLine.slice(0, max - 1).trimEnd()}.`;
+}
+
+function checkpointFromPayload(payload: string): string {
+	const line = payloadLines(payload)[0];
+	if (!line) return "Captured assistant turn evidence.";
+	return `Captured assistant turn: ${compactSentence(line)}`;
+}
+
+function titleFromPayload(payload: string): string {
+	const line = payloadLines(payload)[0];
+	if (!line) return "ADA Session";
+	return compactSentence(line, 80);
+}
+
+export async function recordArtifactData(id: string, data: Record<string, unknown>, checkpoint: string): Promise<Artifact | null> {
+	await acquireLock(id);
+	try {
+		const artifact = readArtifactFromDisk(id);
+		if (!artifact) return null;
+		if (!artifact.data || typeof artifact.data !== "object") artifact.data = {};
+		if (!Array.isArray(artifact.checkpoints)) artifact.checkpoints = [];
+		for (const [key, value] of Object.entries(data)) artifact.data[key] = value;
+		artifact.checkpoints.push({ timestamp: localIsoWithTz(), note: checkpoint });
+		artifact.updated_at = localIsoWithTz();
+		writeArtifactToDisk(artifact);
+		return artifact;
+	} finally {
+		releaseLock(id);
+	}
+}
+
+export async function recordArtifactTurn(id: string, payload: string): Promise<Artifact | null> {
+	const content = payload.trim();
+	if (!content) return readArtifactFromDisk(id);
+	await acquireLock(id);
+	try {
+		const artifact = readArtifactFromDisk(id);
+		if (!artifact) return null;
+		if (!artifact.data || typeof artifact.data !== "object") artifact.data = {};
+		if (!Array.isArray(artifact.checkpoints)) artifact.checkpoints = [];
+		const timestamp = localIsoWithTz();
+		const turns = Array.isArray(artifact.data.turns) ? artifact.data.turns : [];
+		turns.push({ timestamp, content });
+		artifact.data.turns = turns;
+		artifact.checkpoints.push({ timestamp, note: checkpointFromPayload(content) });
+		if (/^tmp-\d+$/.test(artifact.title)) artifact.title = titleFromPayload(content);
+		artifact.updated_at = timestamp;
+		writeArtifactToDisk(artifact);
+		return artifact;
+	} finally {
+		releaseLock(id);
+	}
 }
 
 export function listArtifactsFromDisk(): Artifact[] {

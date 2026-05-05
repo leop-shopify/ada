@@ -67,7 +67,7 @@ afterEach(() => {
 	rmSync(TMP_HOME, { recursive: true, force: true });
 });
 
-describe("ada-write.js track-input", () => {
+describe("ada-write.js track-input legacy compatibility", () => {
 	it("creates a new artifact when none exists", () => {
 		runScript(["track-input", "demo-id", "Demo title"], "hello world\n");
 
@@ -76,30 +76,31 @@ describe("ada-write.js track-input", () => {
 		expect(a!.id).toBe("demo-id");
 		expect(a!.title).toBe("Demo title");
 		expect(a!.type).toBe("general");
-		expect(a!.inputs).toHaveLength(1);
-		expect(a!.inputs[0].content).toBe("hello world\n");
+		expect(a!.inputs).toHaveLength(0);
+		expect(JSON.stringify(a)).not.toContain("hello world");
 		expect(a!.checkpoints).toHaveLength(0);
 		expect(a!.data).toEqual({});
 		expect(a!.size_bytes).toBeGreaterThan(0);
 	});
 
-	it("preserves verbatim multi-line user input in inputs[]", () => {
+	it("does not preserve stdin prompt text in inputs", () => {
 		const input = "line one\nline two\n  indented line three";
 		runScript(["track-input", "multi-line", "ML"], input);
 
 		const a = readArtifact("multi-line");
-		expect(a!.inputs[0].content).toBe(input);
+		expect(a!.inputs).toEqual([]);
+		expect(JSON.stringify(a)).not.toContain("line one");
 	});
 
-	it("appends a new input without losing prior ones", () => {
+	it("does not append prompt text across calls", () => {
 		runScript(["track-input", "two-turn", "Two turn"], "first input");
 		runScript(["track-input", "two-turn", "Two turn"], "second input");
 
 		const a = readArtifact("two-turn");
-		expect(a!.inputs).toHaveLength(2);
-		expect(a!.inputs[0].content).toBe("first input");
-		expect(a!.inputs[1].content).toBe("second input");
+		expect(a!.inputs).toHaveLength(0);
 		expect(a!.checkpoints).toHaveLength(0);
+		expect(JSON.stringify(a)).not.toContain("first input");
+		expect(JSON.stringify(a)).not.toContain("second input");
 	});
 
 	it("never adds the user input to the checkpoints array", () => {
@@ -111,7 +112,7 @@ describe("ada-write.js track-input", () => {
 		}
 	});
 
-	it("never overwrites existing data, checkpoints, or cursor when appending an input", () => {
+	it("never overwrites existing data, checkpoints, cursor, or legacy inputs", () => {
 		seedArtifact({
 			id: "with-data",
 			title: "With data",
@@ -132,8 +133,8 @@ describe("ada-write.js track-input", () => {
 		expect(a!.data).toEqual({ decisions: ["keep these"], counts: 7 });
 		expect(a!.first_input_tokens).toBe(1234);
 		expect(a!.cursor.last_processed_entry_id).toBe("abc");
-		expect(a!.inputs).toHaveLength(2);
-		expect(a!.inputs[1].content).toBe("new input");
+		expect(a!.inputs).toEqual([{ timestamp: "2026-05-04T10:00:00-04:00", content: "original input" }]);
+		expect(JSON.stringify(a)).not.toContain("new input");
 		expect(a!.checkpoints).toHaveLength(1);
 		expect(a!.checkpoints[0].note).toBe("assistant did X");
 	});
@@ -143,18 +144,15 @@ describe("ada-write.js track-input", () => {
 		const a = readArtifact("tz-check");
 		expect(a!.created_at).toMatch(/[+-]\d{2}:\d{2}$/);
 		expect(a!.updated_at).toMatch(/[+-]\d{2}:\d{2}$/);
-		expect(a!.inputs[0].timestamp).toMatch(/[+-]\d{2}:\d{2}$/);
+		expect(a!.inputs).toEqual([]);
 	});
 
-	it("recomputes size_bytes on every write", () => {
+	it("recomputes size_bytes without storing stdin", () => {
 		runScript(["track-input", "size-check", "Size"], "small");
-		const a1 = readArtifact("size-check");
-		const size1 = a1!.size_bytes;
+		const a = readArtifact("size-check");
 
-		runScript(["track-input", "size-check", "Size"], "second input that adds more bytes than the first");
-		const a2 = readArtifact("size-check");
-
-		expect(a2!.size_bytes).toBeGreaterThan(size1);
+		expect(a!.size_bytes).toBeGreaterThan(0);
+		expect(JSON.stringify(a)).not.toContain("small");
 	});
 });
 
@@ -166,7 +164,7 @@ describe("ada-write.js set-meta", () => {
 
 		const a = readArtifact("patch-target");
 		expect(a!.first_input_tokens).toBe(5555);
-		expect(a!.inputs).toHaveLength(1);
+		expect(a!.inputs).toHaveLength(0);
 	});
 
 	it("does nothing when artifact is missing", () => {
@@ -221,21 +219,20 @@ describe("ada-write.js cleanup-old", () => {
 });
 
 describe("ada-write.js concurrent writes", () => {
-	it("serializes concurrent track-input calls without losing inputs", async () => {
+	it("serializes concurrent track-input calls without storing stdin", async () => {
 		await Promise.all([
-			Promise.resolve(runScript(["track-input", "concurrent", "C"], "a")),
-			Promise.resolve(runScript(["track-input", "concurrent", "C"], "b")),
-			Promise.resolve(runScript(["track-input", "concurrent", "C"], "c")),
-			Promise.resolve(runScript(["track-input", "concurrent", "C"], "d")),
+			Promise.resolve(runScript(["track-input", "concurrent", "C"], "prompt-alpha-secret")),
+			Promise.resolve(runScript(["track-input", "concurrent", "C"], "prompt-beta-secret")),
+			Promise.resolve(runScript(["track-input", "concurrent", "C"], "prompt-gamma-secret")),
+			Promise.resolve(runScript(["track-input", "concurrent", "C"], "prompt-delta-secret")),
 		]);
 
 		const a = readArtifact("concurrent");
-		expect(a!.inputs).toHaveLength(4);
-		const contents = a!.inputs.map((i) => i.content);
-		expect(contents).toContain("a");
-		expect(contents).toContain("b");
-		expect(contents).toContain("c");
-		expect(contents).toContain("d");
+		expect(a!.inputs).toHaveLength(0);
+		expect(JSON.stringify(a)).not.toContain("prompt-alpha-secret");
+		expect(JSON.stringify(a)).not.toContain("prompt-beta-secret");
+		expect(JSON.stringify(a)).not.toContain("prompt-gamma-secret");
+		expect(JSON.stringify(a)).not.toContain("prompt-delta-secret");
 	});
 });
 

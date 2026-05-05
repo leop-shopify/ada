@@ -150,7 +150,7 @@ function listAll() {
 	return out;
 }
 
-function cmdTrackInput(id, title, userInput) {
+function cmdTrackInput(id, title) {
 	acquireLock(id);
 	try {
 		let a = readArtifact(id);
@@ -172,7 +172,6 @@ function cmdTrackInput(id, title, userInput) {
 		}
 		if (!Array.isArray(a.inputs)) a.inputs = [];
 		if (!Array.isArray(a.checkpoints)) a.checkpoints = [];
-		a.inputs.push({ timestamp: now, content: userInput });
 		a.updated_at = now;
 		writeArtifactAtomic(a);
 	} finally {
@@ -232,8 +231,8 @@ const sub = process.argv[2];
 if (sub === "track-input") {
 	const id = process.argv[3];
 	const title = process.argv[4] ?? "";
-	const userInput = readStdinSync();
-	cmdTrackInput(id, title, userInput);
+	readStdinSync();
+	cmdTrackInput(id, title);
 } else if (sub === "set-meta") {
 	const id = process.argv[3];
 	const patchJson = process.argv[4];

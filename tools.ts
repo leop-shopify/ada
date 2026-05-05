@@ -1,13 +1,95 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { readArtifactFromDisk } from "./helpers.js";
+import { readArtifactFromDisk, recordArtifactData } from "./helpers.js";
 import type { ADAState, Artifact } from "./types.js";
 
 export function registerTools(
 	pi: ExtensionAPI,
 	state: ADAState,
 ): void {
+
+	pi.registerTool({
+		name: "ada_record",
+		label: "Record Artifact Data",
+		description:
+			"Record durable facts into the active ADA artifact with exactly one checkpoint. " +
+			"Use after fetching evidence or completing a delegated task so the artifact persists the result.",
+		promptSnippet: "Record task evidence into the active artifact with one checkpoint",
+		parameters: Type.Object({
+			data: Type.Record(Type.String(), Type.Unknown(), {
+				description: "Key-value facts to merge into artifact.data",
+			}),
+			checkpoint: Type.String({ description: "One concise checkpoint describing the recorded action" }),
+		}),
+
+		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+			if (!state.artifact) {
+				return {
+					content: [{ type: "text" as const, text: "No active artifact. Use ada_get with an artifact id to connect first." }],
+					details: {},
+				};
+			}
+
+			const updates = params.data as Record<string, unknown>;
+			const keys = Object.keys(updates);
+			if (keys.length === 0) {
+				return {
+					content: [{ type: "text" as const, text: "No data provided. Pass key-value facts to record." }],
+					details: {},
+				};
+			}
+
+			const checkpoint = String(params.checkpoint ?? "").trim();
+			if (!checkpoint) {
+				return {
+					content: [{ type: "text" as const, text: "No checkpoint provided. Pass one concise checkpoint." }],
+					details: {},
+				};
+			}
+
+			const artifact = await recordArtifactData(state.artifact.id, updates, checkpoint);
+			if (!artifact) {
+				const id = state.artifact.id;
+				state.artifact = null;
+				return {
+					content: [{ type: "text" as const, text: `Artifact "${id}" no longer exists on disk.` }],
+					details: {},
+				};
+			}
+
+			state.artifact = artifact;
+			return {
+				content: [{ type: "text", text: `Artifact recorded: ${keys.join(", ")} (checkpoint #${artifact.checkpoints.length})` }],
+				details: { updatedKeys: keys, checkpoint, totalCheckpoints: artifact.checkpoints.length },
+			};
+		},
+
+		renderCall(args, theme) {
+			const a = args as Record<string, unknown>;
+			const data = a.data as Record<string, unknown> | undefined;
+			const keys = data ? Object.keys(data) : [];
+			return new Text(
+				theme.fg("toolTitle", theme.bold("ada_record ")) +
+				theme.fg("muted", keys.length > 0 ? keys.join(", ") : "(empty)"),
+				0, 0,
+			);
+		},
+
+		renderResult(result, { isPartial }, theme) {
+			if (isPartial) return new Text(theme.fg("dim", "Recording..."), 0, 0);
+			const details = result.details as { updatedKeys?: string[]; totalCheckpoints?: number } | undefined;
+			if (details?.updatedKeys) {
+				return new Text(
+					theme.fg("success", details.updatedKeys.join(", ")) +
+					theme.fg("dim", ` (#${details.totalCheckpoints})`),
+					0, 0,
+				);
+			}
+			const text = result.content[0];
+			return new Text(text?.type === "text" ? text.text : "", 0, 0);
+		},
+	});
 
 	pi.registerTool({
 		name: "ada_get",
