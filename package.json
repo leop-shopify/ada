@@ -1,6 +1,6 @@
 {
   "name": "ada-for-pi",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "ADA - Artifact Driven Agent. Structured JSON artifacts for iterative multi-step work in pi.",
   "pi": {
     "extensions": ["./index.ts"],
