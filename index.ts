@@ -1,74 +1,52 @@
-/**
- * ADA — Artifact Driven Agent
- *
- * Extension that maintains structured JSON artifacts during iterative work.
- * When the agent is doing anything multi-step — performance investigations,
- * bug fixes, code reviews, planning — it creates an artifact that serves as
- * the source of truth for the entire conversation.
- *
- * Artifacts are shared across sessions. Any session can resume any artifact
- * via /ada-resume. There is no session binding or lifecycle status.
- * Spawned agents can only read/update — never create.
- *
- * Files:
- *   index.ts   — state, event handlers, wiring
- *   tools.ts   — tool definitions
- *   helpers.ts — disk I/O, persistence, cleanup
- *   types.ts   — all type definitions
- */
-
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { truncateToWidth } from "@mariozechner/pi-tui";
+import { watch, type FSWatcher } from "node:fs";
+import { join } from "node:path";
 import {
-	cleanupOldArtifacts,
 	listArtifactsFromDisk,
 	readArtifactFromDisk,
-	writeArtifactToDisk,
 	persistState,
 	artifactDir,
 	jewelryForComplexity,
 	formatSize,
-	getArtifactFileSize,
-	timeSince as timeSinceDate,
+	timeSince,
+	slugify,
 } from "./helpers.js";
 import { registerTools } from "./tools.js";
+import { loadSettings, registerSettingsCommand } from "./settings.js";
+import {
+	spawnTrackInput,
+	spawnSetMeta,
+	spawnCleanupOld,
+	spawnResponseParser,
+	lastAssistantText,
+} from "./subprocess.js";
+import { registerSoftRestart, registerCompactCommand } from "./compaction.js";
 import type { ADAState, Artifact } from "./types.js";
-
-/** Tool names considered "substantive" for nudge heuristic. */
-const SUBSTANTIVE_TOOLS = new Set([
-	"bash", "read", "edit", "write",
-	"grokt_search", "grokt_bulk_search", "grokt_get_file",
-	"observe_query", "observe_events_by_id", "observe_trace",
-	"data_portal_query_bigquery",
-	"run_experiment",
-	"scan_test_gaps", "design_test_cases", "validate_test_value",
-]);
-
-/** Minimum substantive tool calls before nudging. */
-const NUDGE_THRESHOLD = 2;
 
 const ADA_WIDGET_KEY = "ada-artifact-banner";
 
 export default function adaExtension(pi: ExtensionAPI): void {
-	// ─── Spawned Agent Detection ───────────────────────────────────
-	// Spawned agents can only read/update artifacts. Never create.
-	// They get the artifact ID in their task prompt from the lead.
+	if (process.env.ADA_SUBPROCESS === "1") return;
+
 	const isSpawnedAgent = process.env.PI_AGENT_ROLE === "subagent" ||
 		process.env.PI_TEAM_NAME !== undefined;
 
 	const state: ADAState = {
 		artifact: null,
-		artifactUpdatedThisTurn: false,
-		toolCallsThisTurn: 0,
+		inputOverCap: false,
 	};
 
 	let currentCtx: ExtensionContext | null = null;
+	let firstTurnDone = false;
+	let watcher: FSWatcher | null = null;
+	let watchedId: string | null = null;
+	let refreshTimer: NodeJS.Timeout | null = null;
+	let realUserTurnInFlight = false;
 
-	// ─── Artifact Banner (widget above editor) ───────────────────────
-	// Shows:
-	//   ─────────────────────────────────────────────
-	//     <jewelry>  │  <title>  │  <size>  │  <updated>
-	//   ─────────────────────────────────────────────
+	function getSettings() {
+		return loadSettings();
+	}
 
 	function updateBanner(ctx?: ExtensionContext): void {
 		const c = ctx ?? currentCtx;
@@ -83,19 +61,23 @@ export default function adaExtension(pi: ExtensionAPI): void {
 		const dataKeys = Object.keys(a.data).length;
 		const cpCount = a.checkpoints.length;
 		const jewelry = jewelryForComplexity(dataKeys, cpCount);
-		const size = formatSize(getArtifactFileSize(a.id));
-		const updated = timeSinceDate(new Date(a.updated_at));
+		const size = formatSize(a.size_bytes);
 
 		c.ui.setWidget(ADA_WIDGET_KEY, (_tui, theme) => {
 			return {
 				render: (width: number) => {
-					const sep = theme.fg("dim", " │ ");
-					const content =
-						`  ${jewelry} ` + sep +
+					const sep = theme.fg("dim", " | ");
+					let content =
+						`  ADA ${jewelry}` + sep +
 						theme.fg("accent", theme.bold(a.title)) + sep +
 						theme.fg("muted", size) + sep +
-						theme.fg("muted", updated);
-					const bar = theme.fg("dim", "─".repeat(width));
+						theme.fg("muted", `${cpCount} checkpoints`);
+
+					if (state.inputOverCap) {
+						content += sep + theme.fg("warning", "[INPUT >10% CAP]");
+					}
+
+					const bar = theme.fg("dim", "-".repeat(width));
 					return [bar, truncateToWidth(content, width), bar];
 				},
 				invalidate: () => {},
@@ -103,15 +85,51 @@ export default function adaExtension(pi: ExtensionAPI): void {
 		});
 	}
 
-	// ─── State Restoration ──────────────────────────────────────────
+	function refreshFromDisk(): void {
+		if (!state.artifact) return;
+		const fresh = readArtifactFromDisk(state.artifact.id);
+		if (fresh) {
+			state.artifact = fresh;
+			updateBanner();
+		}
+	}
+
+	function attachWatcher(): void {
+		if (!state.artifact) return;
+		if (watchedId === state.artifact.id) return;
+		detachWatcher();
+		const filePath = join(artifactDir(state.artifact.id), "artifact.json");
+		try {
+			watcher = watch(filePath, { persistent: false }, () => {
+				if (refreshTimer) return;
+				refreshTimer = setTimeout(() => {
+					refreshTimer = null;
+					refreshFromDisk();
+				}, 100);
+			});
+			watchedId = state.artifact.id;
+		} catch {  }
+	}
+
+	function detachWatcher(): void {
+		if (watcher) {
+			try { watcher.close(); } catch {  }
+			watcher = null;
+		}
+		watchedId = null;
+		if (refreshTimer) {
+			clearTimeout(refreshTimer);
+			refreshTimer = null;
+		}
+	}
 
 	function restoreState(ctx: ExtensionContext): void {
 		state.artifact = null;
-		state.artifactUpdatedThisTurn = false;
-		state.toolCallsThisTurn = 0;
+		state.inputOverCap = false;
 		currentCtx = ctx;
+		firstTurnDone = false;
+		detachWatcher();
 
-		// Restore from session branch. Artifacts are shared — no session binding.
 		for (const entry of ctx.sessionManager.getBranch()) {
 			if (entry.type === "custom" && entry.customType === "ada-artifact") {
 				const data = entry.data as { artifact?: { id: string } } | undefined;
@@ -121,7 +139,6 @@ export default function adaExtension(pi: ExtensionAPI): void {
 					state.artifact = null;
 				}
 			}
-
 			if (
 				entry.type === "message" &&
 				entry.message.role === "toolResult" &&
@@ -133,44 +150,102 @@ export default function adaExtension(pi: ExtensionAPI): void {
 			}
 		}
 
-		// Auto-cleanup old artifacts on session start
-		cleanupOldArtifacts(7);
-
-		// Show or hide status bar based on restored state
+		spawnCleanupOld(7);
 		updateBanner(ctx);
+		attachWatcher();
 	}
 
-	// ─── Session Events ─────────────────────────────────────────────
+	pi.on("session_start", async (_event, ctx) => {
+		realUserTurnInFlight = false;
+		restoreState(ctx);
+	});
+	pi.on("session_tree", async (_event, ctx) => {
+		realUserTurnInFlight = false;
+		restoreState(ctx);
+	});
 
-	pi.on("session_start", async (_event, ctx) => restoreState(ctx));
-	pi.on("session_switch", async (_event, ctx) => restoreState(ctx));
-	pi.on("session_fork", async (_event, ctx) => restoreState(ctx));
-	pi.on("session_tree", async (_event, ctx) => restoreState(ctx));
+	pi.on("input", async (event) => {
+		realUserTurnInFlight = event.source !== "extension";
+		return { action: "continue" };
+	});
 
 	pi.on("agent_start", async (_event, ctx) => {
 		currentCtx = ctx;
 	});
 
-	// ─── System Prompt Injection ────────────────────────────────────
-
-	pi.on("before_agent_start", async () => {
-		if (isSpawnedAgent) return; // Spawned agents get tools, not prompt injection
-		if (!state.artifact) return;
-
-		// Re-read from disk to get the latest keys (another agent may have written)
-		const fresh = readArtifactFromDisk(state.artifact.id);
-		if (fresh) {
-			state.artifact.data = fresh.data;
-			state.artifact.checkpoints = fresh.checkpoints;
+	pi.on("before_agent_start", async (event) => {
+		const userInput = event.prompt ?? "";
+		if (!realUserTurnInFlight) {
+			updateBanner();
+			if (!state.artifact || isSpawnedAgent) return;
+			const a = state.artifact;
+			const dataKeys = Object.keys(a.data);
+			const cpCount = a.checkpoints.length;
+			const lastCp = cpCount > 0 ? a.checkpoints[cpCount - 1].note : null;
+			const keysLine = dataKeys.length > 0 ? `\nData keys (${dataKeys.length}): ${dataKeys.join(", ")}` : "";
+			const cpLine = lastCp ? `\nLast checkpoint (#${cpCount}): ${lastCp}` : "";
+			const contextText = `[BACKGROUND STATE -- not the conversation topic]\nActive artifact: "${a.title}" (${a.type}) -- ${a.id}${keysLine}${cpLine}\nUse ada_get with specific key names above to load data when needed.`;
+			const systemText = `${contextText}\nIf the user asks about current work, previous work, implementation status, decisions, files changed, or what happened, call ada_get before answering. Use ada_get with no keys first to inspect the artifact header, then request specific keys if needed.`;
+			return {
+				systemPrompt: `${event.systemPrompt}\n\n${systemText}`,
+			};
 		}
+
+		if (!state.artifact && !isSpawnedAgent) {
+			const seed = userInput
+				.slice(0, 60)
+				.replace(/\n/g, " ")
+				.replace(/[^a-zA-Z0-9 _\-]/g, "")
+				.trim() || "artifact";
+			const slug = slugify(seed) || `artifact-${Date.now().toString(36)}`;
+			const title = slug;
+			const id = slug;
+			const now = new Date();
+			const tzOffset = -now.getTimezoneOffset();
+			const tzH = String(Math.floor(Math.abs(tzOffset) / 60)).padStart(2, "0");
+			const tzM = String(Math.abs(tzOffset) % 60).padStart(2, "0");
+			const tzSign = tzOffset >= 0 ? "+" : "-";
+			const isoWithTz = now.toISOString().replace("Z", `${tzSign}${tzH}:${tzM}`);
+
+			state.artifact = {
+				id,
+				title,
+				type: "general",
+				created_at: isoWithTz,
+				updated_at: isoWithTz,
+				size_bytes: 0,
+				first_input_tokens: null,
+				cursor: { last_processed_entry_id: null },
+				data: {},
+				inputs: [],
+				checkpoints: [],
+			};
+			persistState(pi, state);
+			attachWatcher();
+		}
+
+		if (state.artifact && userInput && !isSpawnedAgent) {
+			spawnTrackInput(state.artifact.id, state.artifact.title, userInput);
+		}
+
+		refreshFromDisk();
+		attachWatcher();
+
+		const settings = getSettings();
+		const promptLen = userInput.length;
+		const approxTokens = Math.ceil(promptLen / 4);
+		state.inputOverCap = approxTokens > settings.constraint_tokens * settings.input_warn_pct;
+
+		updateBanner();
+
+		if (!state.artifact) return;
+		if (isSpawnedAgent) return;
 
 		const a = state.artifact;
 		const dataKeys = Object.keys(a.data);
 		const cpCount = a.checkpoints.length;
 		const lastCp = cpCount > 0 ? a.checkpoints[cpCount - 1].note : null;
 
-		// Build a concise context block so the agent never has to guess key names.
-		// This eliminates the common pattern of ada_get with wrong keys -> header -> correct key.
 		let keysLine = "";
 		if (dataKeys.length > 0) {
 			keysLine = `\nData keys (${dataKeys.length}): ${dataKeys.join(", ")}`;
@@ -180,162 +255,151 @@ export default function adaExtension(pi: ExtensionAPI): void {
 			cpLine = `\nLast checkpoint (#${cpCount}): ${lastCp}`;
 		}
 
+		const contextText = `[BACKGROUND STATE -- not the conversation topic]\nActive artifact: "${a.title}" (${a.type}) -- ${a.id}${keysLine}${cpLine}\nUse ada_get with specific key names above to load data when needed.`;
+		const systemText = `${contextText}\nIf the user asks about current work, previous work, implementation status, decisions, files changed, or what happened, call ada_get before answering. Use ada_get with no keys first to inspect the artifact header, then request specific keys if needed.`;
+
 		return {
-			systemPrompt: undefined,
-			message: {
-				customType: "ada-context",
-				content: `[BACKGROUND STATE -- not the conversation topic]
-Active artifact: "${a.title}" (${a.type}) -- ${a.id}${keysLine}${cpLine}
-Use ada_get with specific key names above to load data when needed.`,
-				display: false,
-			},
+			systemPrompt: `${event.systemPrompt}\n\n${systemText}`,
 		};
 	});
 
-	// ─── Nudge Tracking ─────────────────────────────────────────────
-
-	pi.on("turn_start", async () => {
-		state.artifactUpdatedThisTurn = false;
-		state.toolCallsThisTurn = 0;
-	});
-
-	pi.on("tool_execution_end", async (event) => {
-		if (
-			event.toolName === "ada_create" ||
-			event.toolName === "ada_update" ||
-			event.toolName === "ada_checkpoint"
-		) {
-			state.artifactUpdatedThisTurn = true;
-			updateBanner();
-		} else if (SUBSTANTIVE_TOOLS.has(event.toolName)) {
-			state.toolCallsThisTurn++;
-		}
-	});
-
-	pi.on("agent_end", async () => {
+	pi.on("agent_end", async (event, ctx) => {
 		if (!state.artifact) return;
-		if (state.artifactUpdatedThisTurn) return;
-		if (state.toolCallsThisTurn < NUDGE_THRESHOLD) return;
+		const shouldTrackTurn = realUserTurnInFlight && !isSpawnedAgent;
+		realUserTurnInFlight = false;
 
-		const severity = state.toolCallsThisTurn >= 4 ? "OVERDUE" : "REMINDER";
-		pi.sendMessage(
-			{
-				customType: "ada-nudge",
-				content: `[${severity}] You made ${state.toolCallsThisTurn} substantive tool calls this turn without a checkpoint or update. ` +
-					`Checkpoint what you found before continuing. One discovery, one checkpoint.`,
-				display: true,
-			},
-			{ triggerTurn: false },
-		);
-	});
+		if (!shouldTrackTurn) return;
 
-	// ─── Context Message Filtering ──────────────────────────────────
-
-	pi.on("context", async (event) => {
-		let lastContextIdx = -1;
-		const messages = event.messages;
-
-		for (let i = messages.length - 1; i >= 0; i--) {
-			const msg = messages[i] as typeof messages[number] & { customType?: string };
-			if (msg.customType === "ada-context") {
-				lastContextIdx = i;
-				break;
+		if (!firstTurnDone) {
+			firstTurnDone = true;
+			const usage = ctx.getContextUsage();
+			if (usage && usage.tokens !== null && state.artifact.first_input_tokens === null) {
+				spawnSetMeta(state.artifact.id, { first_input_tokens: usage.tokens });
 			}
 		}
 
+		const settings = getSettings();
+		if (settings.command_enabled && settings.command.trim() && event.messages?.length) {
+			const assistant = lastAssistantText(event.messages);
+			if (assistant) {
+				spawnResponseParser(state.artifact, assistant, settings.command);
+			}
+		}
+	});
+
+	pi.on("context", async (event) => {
 		return {
-			messages: messages.filter((m, i) => {
+			messages: event.messages.filter((m) => {
 				const msg = m as typeof m & { customType?: string };
 				if (msg.customType === "ada-nudge") return false;
-				if (msg.customType === "ada-context" && i !== lastContextIdx) return false;
+				if (msg.customType === "ada-context") return false;
 				return true;
 			}),
 		};
 	});
 
-	// ─── /ada-resume Command ─────────────────────────────────────────
+	pi.on("tool_call", async (event) => {
+		if (event.toolName !== "team_spawn") return;
+		if (!state.artifact) return;
+		if (isSpawnedAgent) return;
 
+		const input = event.input as { task?: string };
+		if (!input.task) return;
+
+		const artifactId = state.artifact.id;
+		const dir = artifactDir(artifactId);
+		const dataKeys = Object.keys(state.artifact.data);
+		const keysInfo = dataKeys.length > 0
+			? `\nAvailable data keys: ${dataKeys.join(", ")}`
+			: "";
+
+		input.task += `\n\nActive ADA artifact: ${artifactId}\n` +
+			`Artifact folder: ${dir}/\n` +
+			`Use ada_get with id="${artifactId}" to connect, then ada_get with specific keys to load what you need. ` +
+			`Artifacts are read-only from agents. ada_create, ada_update, and ada_checkpoint do not exist. ` +
+			`Just do the work and report back; the artifact reflects what happened.` +
+			keysInfo;
+	});
+
+	registerAdaResumeCommand(pi, state, updateBanner, attachWatcher);
+	registerAdaInspectCommand(pi, state);
+	registerCompactCommand(pi);
+	registerSettingsCommand(pi);
+	registerSoftRestart(pi, state, getSettings);
+	registerTools(pi, state);
+}
+
+function registerAdaResumeCommand(
+	pi: ExtensionAPI,
+	state: ADAState,
+	updateBanner: (ctx?: ExtensionContext) => void,
+	attachWatcher: () => void,
+): void {
 	pi.registerCommand("ada-resume", {
-		description: "Resume an ADA artifact by ID, interactive picker, or search (use / to search)",
+		description: "Resume an ADA artifact by ID, interactive picker, or search",
 		handler: async (args, ctx) => {
 			let id = (args ?? "").trim();
 
-			// "/" or "search" jumps straight to search mode
-			const isSearchMode = id === "/" || id.toLowerCase() === "search";
-			if (isSearchMode) id = "";
-
-			// No ID provided -- show interactive picker with pagination + search
-			if (!id) {
-				const all = listArtifactsFromDisk();
-				const currentId = state.artifact?.id;
-				let pool = all.filter((a) => a.id !== currentId);
-				if (pool.length === 0) {
-					ctx.ui.notify("No other artifacts to resume.", "info");
+			if (id && id !== "/" && id.toLowerCase() !== "search") {
+				const direct = readArtifactFromDisk(id);
+				if (direct) {
+					await completeResume(direct);
 					return;
 				}
+			}
 
-				const PAGE_SIZE = 20;
-				let page = 0;
-				let searchTerm = "";
+			const all = listArtifactsFromDisk();
+			const currentId = state.artifact?.id;
+			const pool = all.filter((a) => a.id !== currentId);
+			if (pool.length === 0) {
+				ctx.ui.notify("No other artifacts to resume.", "info");
+				return;
+			}
 
-				// If launched with "/" or "search", prompt for search immediately
-				if (isSearchMode) {
-					const term = await ctx.ui.input("Search artifacts:", "title, id, or type");
-					if (!term) return;
-					searchTerm = term;
+			const term = await ctx.ui.input("Search artifacts (empty for all):", "title, id, or type");
+			if (term === undefined) return;
+			const searchTerm = term.trim();
+
+			const filtered = searchTerm
+				? pool.filter((a) => `${a.title} ${a.id} ${a.type}`.toLowerCase().includes(searchTerm.toLowerCase()))
+				: pool;
+
+			if (filtered.length === 0) {
+				ctx.ui.notify(`No artifacts matching "${searchTerm}".`, "info");
+				return;
+			}
+
+			const PAGE_SIZE = 20;
+			let page = 0;
+
+			while (true) {
+				const totalPages = Math.ceil(filtered.length / PAGE_SIZE);
+				if (page >= totalPages) page = totalPages - 1;
+				if (page < 0) page = 0;
+				const start = page * PAGE_SIZE;
+				const slice = filtered.slice(start, start + PAGE_SIZE);
+
+				const options: string[] = [];
+				if (page > 0) options.push("<< Previous page");
+				for (const a of slice) {
+					const age = timeSince(new Date(a.updated_at));
+					options.push(`${a.title} (${Object.keys(a.data ?? {}).length} keys, ${age}) -- ${a.id}`);
 				}
+				if (page < totalPages - 1) options.push(">> Next page");
 
-				picker: while (true) {
-					const filtered = searchTerm
-						? pool.filter((a) => {
-								const hay = `${a.title} ${a.id} ${a.type}`.toLowerCase();
-								return hay.includes(searchTerm.toLowerCase());
-							})
-						: pool;
+				const label = searchTerm
+					? `Resume ("${searchTerm}", ${filtered.length} matches, page ${page + 1}/${totalPages}):`
+					: `Resume (${filtered.length} total, page ${page + 1}/${totalPages}):`;
 
-					if (filtered.length === 0) {
-						ctx.ui.notify(`No artifacts matching "${searchTerm}".`, "info");
-						searchTerm = "";
-						page = 0;
-						continue;
-					}
+				const choice = await ctx.ui.select(label, options);
+				if (!choice) return;
+				if (choice === "<< Previous page") { page--; continue; }
+				if (choice === ">> Next page") { page++; continue; }
 
-					const totalPages = Math.ceil(filtered.length / PAGE_SIZE);
-					if (page >= totalPages) page = totalPages - 1;
-					const start = page * PAGE_SIZE;
-					const slice = filtered.slice(start, start + PAGE_SIZE);
-
-					const options: string[] = [];
-					// Search/clear at the top for quick access
-					options.push(searchTerm ? `[x] Clear search ("${searchTerm}")` : "[/] Search...");
-					if (page > 0) options.push("<< Previous page");
-					for (const a of slice) {
-						const age = timeSince(new Date(a.updated_at));
-						options.push(`${a.title} (${Object.keys(a.data ?? {}).length} keys, ${age} ago) -- ${a.id}`);
-					}
-					if (page < totalPages - 1) options.push(">> Next page");
-
-					const label = searchTerm
-						? `Resume artifact ("${searchTerm}", ${filtered.length} matches, page ${page + 1}/${totalPages}):`
-						: `Resume artifact (${filtered.length} total, page ${page + 1}/${totalPages}):`;
-
-					const choice = await ctx.ui.select(label, options);
-					if (!choice) return;
-
-					if (choice === "<< Previous page") { page--; continue; }
-					if (choice === ">> Next page") { page++; continue; }
-					if (choice.startsWith("[x] Clear search")) { searchTerm = ""; page = 0; continue; }
-					if (choice === "[/] Search...") {
-						const term = await ctx.ui.input("Search artifacts:", "title, id, or type");
-						if (term) { searchTerm = term; page = 0; }
-						continue;
-					}
-
-					const match = choice.match(/-- (.+)$/);
-					if (!match) return;
-					id = match[1];
-					break picker;
-				}
+				const match = choice.match(/-- (.+)$/);
+				if (!match) return;
+				id = match[1];
+				break;
 			}
 
 			const artifact = readArtifactFromDisk(id);
@@ -343,49 +407,30 @@ Use ada_get with specific key names above to load data when needed.`,
 				ctx.ui.notify(`Artifact not found: ${id}`, "error");
 				return;
 			}
+			await completeResume(artifact);
 
-			// Detach current artifact if one exists, then switch
-			if (state.artifact) {
-				state.artifact.updated_at = new Date().toISOString();
-				writeArtifactToDisk(state.artifact);
+			async function completeResume(a: Artifact): Promise<void> {
+				if (state.artifact) spawnSetMeta(state.artifact.id, {});
+				state.artifact = a;
+				spawnSetMeta(a.id, {});
+				persistState(pi, state);
+
+				const dataKeys = Object.keys(a.data ?? {});
+				const cpCount = (a.checkpoints ?? []).length;
+				ctx.ui.notify(`Resumed: "${a.title}" (${dataKeys.length} keys, ${cpCount} checkpoints)`, "info");
+				updateBanner(ctx);
+				attachWatcher();
+
+
 			}
-
-			artifact.updated_at = new Date().toISOString();
-			state.artifact = artifact;
-			writeArtifactToDisk(artifact);
-			persistState(pi, state);
-
-			const dataKeys = Object.keys(artifact.data ?? {});
-			const cpCount = (artifact.checkpoints ?? []).length;
-			ctx.ui.notify(`Resumed: "${artifact.title}" (${dataKeys.length} keys, ${cpCount} checkpoints)`, "info");
-			updateBanner(ctx);
-
-			// Inject a context message with the keys so the agent knows what data
-			// is available without having to call ada_get(header) first.
-			const lastCp = cpCount > 0 ? artifact.checkpoints[cpCount - 1].note : null;
-			let keysLine = "";
-			if (dataKeys.length > 0) {
-				keysLine = `\nData keys (${dataKeys.length}): ${dataKeys.join(", ")}`;
-			}
-			let cpLine = "";
-			if (lastCp) {
-				cpLine = `\nLast checkpoint (#${cpCount}): ${lastCp}`;
-			}
-			pi.sendMessage(
-				{
-					customType: "ada-context",
-					content: `[BACKGROUND STATE -- not the conversation topic]
-Resumed artifact: "${artifact.title}" (${artifact.type}) -- ${artifact.id}${keysLine}${cpLine}
-Use ada_get with specific key names above to load data when needed.`,
-					display: false,
-				},
-				{ triggerTurn: false },
-			);
 		},
 	});
+}
 
-	// ─── /ada-inspect Command ────────────────────────────────────────
-
+function registerAdaInspectCommand(
+	pi: ExtensionAPI,
+	state: ADAState,
+): void {
 	pi.registerCommand("ada-inspect", {
 		description: "Open a visual artifact inspector in the browser",
 		handler: async (args, ctx) => {
@@ -394,15 +439,10 @@ Use ada_get with specific key names above to load data when needed.`,
 			const { fileURLToPath } = await import("node:url");
 			const { execSync } = await import("node:child_process");
 
-			// Determine which artifact to inspect
 			let targetId = (args ?? "").trim();
-
-			if (!targetId && state.artifact) {
-				targetId = state.artifact.id;
-			}
+			if (!targetId && state.artifact) targetId = state.artifact.id;
 
 			if (!targetId) {
-				// Show interactive picker with pagination + search
 				const all = listArtifactsFromDisk();
 				if (all.length === 0) {
 					ctx.ui.notify("No artifacts to inspect.", "info");
@@ -413,12 +453,9 @@ Use ada_get with specific key names above to load data when needed.`,
 				let page = 0;
 				let searchTerm = "";
 
-				picker: while (true) {
+				while (true) {
 					const filtered = searchTerm
-						? all.filter((a) => {
-								const hay = `${a.title} ${a.id} ${a.type}`.toLowerCase();
-								return hay.includes(searchTerm.toLowerCase());
-							})
+						? all.filter((a) => `${a.title} ${a.id} ${a.type}`.toLowerCase().includes(searchTerm.toLowerCase()))
 						: all;
 
 					if (filtered.length === 0) {
@@ -430,17 +467,17 @@ Use ada_get with specific key names above to load data when needed.`,
 
 					const totalPages = Math.ceil(filtered.length / PAGE_SIZE);
 					if (page >= totalPages) page = totalPages - 1;
+					if (page < 0) page = 0;
 					const start = page * PAGE_SIZE;
 					const slice = filtered.slice(start, start + PAGE_SIZE);
 
 					const options: string[] = [];
-					// Search/clear at the top for quick access
 					options.push(searchTerm ? `[x] Clear search ("${searchTerm}")` : "[/] Search...");
 					if (page > 0) options.push("<< Previous page");
 					for (const a of slice) {
 						const age = timeSince(new Date(a.updated_at));
 						const cpCount = (a.checkpoints ?? []).length;
-						options.push(`${a.title} (${cpCount} cp, ${age} ago) -- ${a.id}`);
+						options.push(`${a.title} (${cpCount} cp, ${age}) -- ${a.id}`);
 					}
 					if (page < totalPages - 1) options.push(">> Next page");
 
@@ -463,7 +500,7 @@ Use ada_get with specific key names above to load data when needed.`,
 					const match = choice.match(/-- (.+)$/);
 					if (!match) return;
 					targetId = match[1];
-					break picker;
+					break;
 				}
 			}
 
@@ -473,92 +510,41 @@ Use ada_get with specific key names above to load data when needed.`,
 				return;
 			}
 
-			// Collect sibling artifact summaries (lightweight -- just id, title, updated_at, type)
 			const allArtifacts = listArtifactsFromDisk();
 			const siblings = allArtifacts
 				.map((a) => ({ id: a.id, title: a.title, updated_at: a.updated_at, type: a.type }))
 				.sort((a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime());
 
-			// Read the HTML template
 			const extDir = dirname(fileURLToPath(import.meta.url));
 			const templatePath = join(extDir, "inspect.html");
 			let html = readFileSync(templatePath, "utf-8");
 
-			// Inject artifact data before the closing </script> tag
-			// Escape </ sequences to prevent XSS breakout from artifact data containing </script>
 			const safeJson = (obj: unknown) => JSON.stringify(obj).replace(/<\//g, "<\\/");
 			const injection = `\nwindow.__ADA_ARTIFACT__ = ${safeJson(artifact)};\n` +
 				`window.__ADA_SIBLINGS__ = ${safeJson(siblings)};\n`;
-			html = html.replace(
-				"// \u2500\u2500 Inline data injection (used by ada-inspect command) \u2500\u2500",
-				"// \u2500\u2500 Inline data injection (used by ada-inspect command) \u2500\u2500\n" + injection,
-			);
 
-			// Write to artifact folder and open in browser
+			const marker = "// -- Inline data injection (used by ada-inspect command) --";
+			if (html.includes(marker)) {
+				html = html.replace(marker, marker + "\n" + injection);
+			} else {
+				html = html.replace("</script>", injection + "\n</script>");
+			}
+
 			const outPath = join(artifactDir(targetId), "inspect.html");
 			writeFileSync(outPath, html, "utf-8");
 
 			try {
 				execSync(`open "${outPath}"`);
 			} catch {
-				// Fallback for Linux
-				try { execSync(`xdg-open "${outPath}"`); } catch { /* ignore */ }
+				try { execSync(`xdg-open "${outPath}"`); } catch {  }
 			}
 
 			const cpCount = (artifact.checkpoints ?? []).length;
 			const keyCount = Object.keys(artifact.data ?? {}).length;
 			ctx.ui.notify(
-				`Inspecting: "${artifact.title}" (${keyCount} keys, ${cpCount} checkpoints)\n` +
-				`Opened: ${outPath}`,
+				`Inspecting: "${artifact.title}" (${keyCount} keys, ${cpCount} checkpoints)\nOpened: ${outPath}`,
 				"info",
 			);
 		},
 	});
-
-	// ─── Artifact Injection into team_spawn ────────────────────────
-	// When the lead spawns a teammate while an artifact is active, append
-	// the artifact ID to the task so the spawned agent auto-connects.
-	// This is the explicit handoff — no guessing, no disk scanning.
-
-	pi.on("tool_call", async (event) => {
-		if (event.toolName !== "team_spawn") return;
-		if (!state.artifact) return;
-		if (isSpawnedAgent) return; // only leads inject
-
-		const input = event.input as { task?: string };
-		if (!input.task) return;
-
-		const artifactId = state.artifact.id;
-		const dir = artifactDir(artifactId);
-		const dataKeys = Object.keys(state.artifact.data);
-		const keysInfo = dataKeys.length > 0
-			? `\nAvailable data keys: ${dataKeys.join(", ")}`
-			: "";
-		input.task += `\n\nActive ADA artifact: ${artifactId}\n` +
-			`Artifact folder: ${dir}/\n` +
-			`Use ada_get with id="${artifactId}" to connect, then ada_update to write findings.` +
-			keysInfo +
-			`\n\nCHECKPOINT DISCIPLINE (mandatory):\n` +
-			`Checkpoint after EVERY meaningful step. Never batch.\n` +
-			`For code changes: one edit, one test run, one checkpoint.\n` +
-			`For research: one search+discovery, one checkpoint. If you called 2+ tools since your last checkpoint, you are overdue.\n` +
-			`Each checkpoint says what you found or changed, not the overall status. Granular, not summary.`;
-	});
-
-	// ─── Register Tools ─────────────────────────────────────────────
-
-	registerTools(pi, state, isSpawnedAgent);
-}
-
-// ─── Utility ──────────────────────────────────────────────────────────
-
-function timeSince(date: Date): string {
-	const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
-	if (seconds < 60) return `${seconds}s`;
-	const minutes = Math.floor(seconds / 60);
-	if (minutes < 60) return `${minutes}m`;
-	const hours = Math.floor(minutes / 60);
-	if (hours < 24) return `${hours}h`;
-	const days = Math.floor(hours / 24);
-	return `${days}d`;
 }
