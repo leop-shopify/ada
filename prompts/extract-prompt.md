@@ -27,7 +27,7 @@ Names, numbers, files changed, historical analysis, and anything valuable must b
 -> data is designed to append to previous data, not only modify it, so the next agent can think through the information as necessary. Instead of changing "topic": "a" into "topic": "a + b + c", evolve it into "topics": ["a", "b", "c"].
 -> data must be preserved when valuable to the next prompt without erasing previous data, unless they contradict each other. Example: if tracking John age, it was 20 years old in the first prompt, and during the 5th prompt you discover he is actually 21, do not keep 2 John ages. Keep one, unless it matters for context that it changed from 20 to 21, in which case persist both.
 
-The inputs array is legacy extension-owned state. Do not write to it, read from it, summarize it, or duplicate inputs into checkpoints.
+The inputs array is extension-owned user input history. Do not write to it, but you may read it for context. Do not duplicate inputs into checkpoints.
 
 A payload is a full window of context with many bytes of information. Preserving checkpoints and data is extracting the most important information that can be reutilized in future follow-ups or new prompts entirely.
 

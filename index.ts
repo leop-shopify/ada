@@ -221,8 +221,8 @@ export default function adaExtension(pi: ExtensionAPI): void {
 			attachWatcher();
 		}
 
-		if (state.artifact && !isSpawnedAgent) {
-			spawnTrackInput(state.artifact.id, state.artifact.title, "");
+		if (state.artifact && userInput && !isSpawnedAgent) {
+			spawnTrackInput(state.artifact.id, state.artifact.title, userInput);
 		}
 
 		if (isSpawnedAgent) return;

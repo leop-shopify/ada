@@ -76,31 +76,29 @@ describe("ada-write.js track-input legacy compatibility", () => {
 		expect(a!.id).toBe("demo-id");
 		expect(a!.title).toBe("Demo title");
 		expect(a!.type).toBe("general");
-		expect(a!.inputs).toHaveLength(0);
-		expect(JSON.stringify(a)).not.toContain("hello world");
+		expect(a!.inputs).toHaveLength(1);
+		expect(a!.inputs[0].content).toBe("hello world\n");
 		expect(a!.checkpoints).toHaveLength(0);
 		expect(a!.data).toEqual({});
 		expect(a!.size_bytes).toBeGreaterThan(0);
 	});
 
-	it("does not preserve stdin prompt text in inputs", () => {
+	it("preserves multi-line user input in inputs", () => {
 		const input = "line one\nline two\n  indented line three";
 		runScript(["track-input", "multi-line", "ML"], input);
 
 		const a = readArtifact("multi-line");
-		expect(a!.inputs).toEqual([]);
-		expect(JSON.stringify(a)).not.toContain("line one");
+		expect(a!.inputs).toHaveLength(1);
+		expect(a!.inputs[0].content).toBe(input);
 	});
 
-	it("does not append prompt text across calls", () => {
+	it("appends prompt text across calls", () => {
 		runScript(["track-input", "two-turn", "Two turn"], "first input");
 		runScript(["track-input", "two-turn", "Two turn"], "second input");
 
 		const a = readArtifact("two-turn");
-		expect(a!.inputs).toHaveLength(0);
+		expect(a!.inputs.map((entry) => entry.content)).toEqual(["first input", "second input"]);
 		expect(a!.checkpoints).toHaveLength(0);
-		expect(JSON.stringify(a)).not.toContain("first input");
-		expect(JSON.stringify(a)).not.toContain("second input");
 	});
 
 	it("never adds the user input to the checkpoints array", () => {
@@ -133,8 +131,9 @@ describe("ada-write.js track-input legacy compatibility", () => {
 		expect(a!.data).toEqual({ decisions: ["keep these"], counts: 7 });
 		expect(a!.first_input_tokens).toBe(1234);
 		expect(a!.cursor.last_processed_entry_id).toBe("abc");
-		expect(a!.inputs).toEqual([{ timestamp: "2026-05-04T10:00:00-04:00", content: "original input" }]);
-		expect(JSON.stringify(a)).not.toContain("new input");
+		expect(a!.inputs).toHaveLength(2);
+		expect(a!.inputs[0]).toEqual({ timestamp: "2026-05-04T10:00:00-04:00", content: "original input" });
+		expect(a!.inputs[1].content).toBe("new input");
 		expect(a!.checkpoints).toHaveLength(1);
 		expect(a!.checkpoints[0].note).toBe("assistant did X");
 	});
@@ -144,15 +143,15 @@ describe("ada-write.js track-input legacy compatibility", () => {
 		const a = readArtifact("tz-check");
 		expect(a!.created_at).toMatch(/[+-]\d{2}:\d{2}$/);
 		expect(a!.updated_at).toMatch(/[+-]\d{2}:\d{2}$/);
-		expect(a!.inputs).toEqual([]);
+		expect(a!.inputs[0].timestamp).toMatch(/[+-]\d{2}:\d{2}$/);
 	});
 
-	it("recomputes size_bytes without storing stdin", () => {
+	it("recomputes size_bytes while storing stdin", () => {
 		runScript(["track-input", "size-check", "Size"], "small");
 		const a = readArtifact("size-check");
 
 		expect(a!.size_bytes).toBeGreaterThan(0);
-		expect(JSON.stringify(a)).not.toContain("small");
+		expect(a!.inputs[0].content).toBe("small");
 	});
 });
 
@@ -164,7 +163,7 @@ describe("ada-write.js set-meta", () => {
 
 		const a = readArtifact("patch-target");
 		expect(a!.first_input_tokens).toBe(5555);
-		expect(a!.inputs).toHaveLength(0);
+		expect(a!.inputs).toHaveLength(1);
 	});
 
 	it("does nothing when artifact is missing", () => {
@@ -219,7 +218,7 @@ describe("ada-write.js cleanup-old", () => {
 });
 
 describe("ada-write.js concurrent writes", () => {
-	it("serializes concurrent track-input calls without storing stdin", async () => {
+	it("serializes concurrent track-input calls while storing stdin", async () => {
 		await Promise.all([
 			Promise.resolve(runScript(["track-input", "concurrent", "C"], "prompt-alpha-secret")),
 			Promise.resolve(runScript(["track-input", "concurrent", "C"], "prompt-beta-secret")),
@@ -228,11 +227,12 @@ describe("ada-write.js concurrent writes", () => {
 		]);
 
 		const a = readArtifact("concurrent");
-		expect(a!.inputs).toHaveLength(0);
-		expect(JSON.stringify(a)).not.toContain("prompt-alpha-secret");
-		expect(JSON.stringify(a)).not.toContain("prompt-beta-secret");
-		expect(JSON.stringify(a)).not.toContain("prompt-gamma-secret");
-		expect(JSON.stringify(a)).not.toContain("prompt-delta-secret");
+		expect(a!.inputs.map((entry) => entry.content).sort()).toEqual([
+			"prompt-alpha-secret",
+			"prompt-beta-secret",
+			"prompt-delta-secret",
+			"prompt-gamma-secret",
+		]);
 	});
 });
 
