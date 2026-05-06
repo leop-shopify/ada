@@ -31,7 +31,6 @@ import {
 	jewelryForComplexity,
 	formatSize,
 	getArtifactFileSize,
-	timeSince as timeSinceDate,
 } from "./helpers.js";
 import { registerTools } from "./tools.js";
 import type { ADAState, Artifact, ArtifactInput, Checkpoint } from "./types.js";
@@ -158,14 +157,12 @@ export default function adaExtension(pi: ExtensionAPI): void {
 
 		if (!state.artifact) {
 			c.ui.setWidget(ADA_WIDGET_KEY, undefined);
-			c.ui.setStatus("ada-checkpoints", undefined);
 			return;
 		}
 
 		const a = refreshArtifactFromDisk();
 		if (!a) {
 			c.ui.setWidget(ADA_WIDGET_KEY, undefined);
-			c.ui.setStatus("ada-checkpoints", undefined);
 			return;
 		}
 
@@ -174,9 +171,7 @@ export default function adaExtension(pi: ExtensionAPI): void {
 		const inputCount = a.inputs?.length ?? 0;
 		const jewelry = jewelryForComplexity(dataKeys, cpCount, inputCount);
 		const size = formatSize(getArtifactFileSize(a.id));
-		const updated = timeSinceDate(new Date(a.updated_at));
 
-		c.ui.setStatus("ada-checkpoints", `checkpoints: ${cpCount}`);
 		c.ui.setWidget(ADA_WIDGET_KEY, (_tui, theme) => {
 			return {
 				render: (width: number) => {
@@ -185,7 +180,7 @@ export default function adaExtension(pi: ExtensionAPI): void {
 						`  ${jewelry} ` + sep +
 						theme.fg("accent", theme.bold(a.title)) + sep +
 						theme.fg("muted", size) + sep +
-						theme.fg("muted", updated);
+						theme.fg("muted", `${cpCount} checkpoints`);
 					const bar = theme.fg("dim", "─".repeat(width));
 					return [bar, truncateToWidth(content, width), bar];
 				},
