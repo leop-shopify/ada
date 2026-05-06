@@ -21,6 +21,12 @@ export interface Checkpoint {
 	note: string;
 }
 
+export interface ArtifactInput {
+	timestamp: string;
+	text: string;
+	source: string;
+}
+
 /** The full artifact document, serialized to JSON on disk. */
 export interface Artifact {
 	/** Unique identifier: slug derived from title. */
@@ -50,6 +56,7 @@ export interface Artifact {
 	data: Record<string, unknown>;
 	/** Progress breadcrumbs. Marks milestones, not a journal. */
 	checkpoints: Checkpoint[];
+	inputs?: ArtifactInput[];
 	/** Final summary written when the artifact is closed. */
 	summary?: string;
 }

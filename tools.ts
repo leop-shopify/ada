@@ -128,6 +128,7 @@ export function registerTools(
 				updated_at: now.toISOString(),
 				data: {},
 				checkpoints: [],
+				inputs: [],
 			};
 
 			state.artifact = artifact;

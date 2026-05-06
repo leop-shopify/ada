@@ -14,7 +14,7 @@ import type { ADAState, Artifact } from "./types.js";
 import { ARTIFACTS_DIR } from "./types.js";
 
 // ─── Jewelry Tiers ──────────────────────────────────────────────────
-// Complexity = data keys + checkpoints. More complex artifacts get fancier gems.
+// Complexity = data keys + checkpoints + inputs. More complex artifacts get fancier gems.
 
 const JEWELRY_TIERS = [
 	{ emoji: "\u{1FAA8}", min: 0 },   // rock
@@ -23,10 +23,10 @@ const JEWELRY_TIERS = [
 	{ emoji: "\u{2B50}", min: 30 },   // star (legendary)
 ] as const;
 
-/** Pick a jewelry emoji based on artifact complexity (keys + checkpoints). */
-export function jewelryForComplexity(dataKeys: number, checkpoints: number): string {
-	const complexity = dataKeys + checkpoints;
-	let emoji = JEWELRY_TIERS[0].emoji;
+/** Pick a jewelry emoji based on artifact complexity. */
+export function jewelryForComplexity(dataKeys: number, checkpoints: number, inputs: number = 0): string {
+	const complexity = dataKeys + checkpoints + inputs;
+	let emoji: string = JEWELRY_TIERS[0].emoji;
 	for (const tier of JEWELRY_TIERS) {
 		if (complexity >= tier.min) emoji = tier.emoji;
 	}

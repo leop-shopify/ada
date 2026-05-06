@@ -18,7 +18,7 @@
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { truncateToWidth } from "@mariozechner/pi-tui";
+import { Text, truncateToWidth } from "@mariozechner/pi-tui";
 import {
 	cleanupOldArtifacts,
 	listArtifactsFromDisk,
@@ -26,13 +26,15 @@ import {
 	writeArtifactToDisk,
 	persistState,
 	artifactDir,
+	acquireLock,
+	releaseLock,
 	jewelryForComplexity,
 	formatSize,
 	getArtifactFileSize,
 	timeSince as timeSinceDate,
 } from "./helpers.js";
 import { registerTools } from "./tools.js";
-import type { ADAState, Artifact } from "./types.js";
+import type { ADAState, Artifact, ArtifactInput } from "./types.js";
 
 const MUTATING_TOOLS = new Set(["edit", "write"]);
 
@@ -74,6 +76,44 @@ export default function adaExtension(pi: ExtensionAPI): void {
 
 	let currentCtx: ExtensionContext | null = null;
 
+	function refreshArtifactFromDisk(): Artifact | null {
+		if (!state.artifact) return null;
+		const fresh = readArtifactFromDisk(state.artifact.id);
+		if (!fresh) {
+			state.artifact = null;
+			return null;
+		}
+		state.artifact = fresh;
+		return fresh;
+	}
+
+	async function persistUserInput(text: string, source: string): Promise<void> {
+		if (!state.artifact) return;
+		const value = text.trim();
+		if (!value) return;
+		const artifactId = state.artifact.id;
+		await acquireLock(artifactId);
+		try {
+			const fresh = readArtifactFromDisk(artifactId);
+			if (!fresh) return;
+			const input: ArtifactInput = {
+				timestamp: new Date().toISOString(),
+				text: value,
+				source,
+			};
+			fresh.inputs = [...(fresh.inputs ?? []), input];
+			fresh.updated_at = new Date().toISOString();
+			writeArtifactToDisk(fresh);
+			state.artifact = fresh;
+			persistState(pi, state);
+		} finally {
+			releaseLock(artifactId);
+		}
+	}
+
+	pi.registerMessageRenderer("ada-nudge", () => new Text("", 0, 0));
+	pi.registerMessageRenderer("ada-checkpoint-instruction", () => new Text("", 0, 0));
+
 	// ─── Artifact Banner (widget above editor) ───────────────────────
 	// Shows:
 	//   ─────────────────────────────────────────────
@@ -86,16 +126,25 @@ export default function adaExtension(pi: ExtensionAPI): void {
 
 		if (!state.artifact) {
 			c.ui.setWidget(ADA_WIDGET_KEY, undefined);
+			c.ui.setStatus("ada-checkpoints", undefined);
 			return;
 		}
 
-		const a = state.artifact;
+		const a = refreshArtifactFromDisk();
+		if (!a) {
+			c.ui.setWidget(ADA_WIDGET_KEY, undefined);
+			c.ui.setStatus("ada-checkpoints", undefined);
+			return;
+		}
+
 		const dataKeys = Object.keys(a.data).length;
 		const cpCount = a.checkpoints.length;
-		const jewelry = jewelryForComplexity(dataKeys, cpCount);
+		const inputCount = a.inputs?.length ?? 0;
+		const jewelry = jewelryForComplexity(dataKeys, cpCount, inputCount);
 		const size = formatSize(getArtifactFileSize(a.id));
 		const updated = timeSinceDate(new Date(a.updated_at));
 
+		c.ui.setStatus("ada-checkpoints", `checkpoints: ${cpCount}`);
 		c.ui.setWidget(ADA_WIDGET_KEY, (_tui, theme) => {
 			return {
 				render: (width: number) => {
@@ -162,6 +211,12 @@ export default function adaExtension(pi: ExtensionAPI): void {
 		currentCtx = ctx;
 	});
 
+	pi.on("input", async (event) => {
+		if (isSpawnedAgent || event.source === "extension") return;
+		await persistUserInput(event.text, event.source);
+		updateBanner();
+	});
+
 	// ─── System Prompt Injection ────────────────────────────────────
 
 	pi.on("before_agent_start", async () => {
@@ -171,8 +226,7 @@ export default function adaExtension(pi: ExtensionAPI): void {
 		// Re-read from disk to get the latest keys (another agent may have written)
 		const fresh = readArtifactFromDisk(state.artifact.id);
 		if (fresh) {
-			state.artifact.data = fresh.data;
-			state.artifact.checkpoints = fresh.checkpoints;
+			state.artifact = fresh;
 		}
 
 		const a = state.artifact;
@@ -263,10 +317,11 @@ Checkpoint discipline: after edit/write, call ada_checkpoint immediately. After 
 
 		pi.sendMessage(
 			{
-				customType: "ada-nudge",
-				content: `[CHECKPOINT REQUIRED] ${reasons.join("; ")}. Call ada_checkpoint now before doing anything else. ` +
+				customType: "ada-checkpoint-instruction",
+				content: `[BACKGROUND CHECKPOINT REQUIRED -- do not repeat this to the user] ${reasons.join("; ")}. ` +
+					`Call ada_checkpoint now before doing anything else. ` +
 					`For edit/write, checkpoint the exact file change. For reads, checkpoint the important finding or batch loaded.`,
-				display: true,
+				display: false,
 			},
 			{ triggerTurn: true },
 		);
@@ -276,35 +331,20 @@ Checkpoint discipline: after edit/write, call ada_checkpoint immediately. After 
 
 	pi.on("context", async (event) => {
 		let lastContextIdx = -1;
-		let lastNudgeIdx = -1;
-		let checkpointAfterLastNudge = false;
 		const messages = event.messages;
 
 		for (let i = messages.length - 1; i >= 0; i--) {
-			const msg = messages[i] as typeof messages[number] & { customType?: string; role?: string; toolName?: string };
-			if (lastContextIdx === -1 && msg.customType === "ada-context") {
+			const msg = messages[i] as typeof messages[number] & { customType?: string };
+			if (msg.customType === "ada-context") {
 				lastContextIdx = i;
-			}
-			if (lastNudgeIdx === -1 && msg.customType === "ada-nudge") {
-				lastNudgeIdx = i;
-			}
-			if (lastContextIdx !== -1 && lastNudgeIdx !== -1) break;
-		}
-
-		if (lastNudgeIdx !== -1) {
-			for (let i = lastNudgeIdx + 1; i < messages.length; i++) {
-				const msg = messages[i] as typeof messages[number] & { role?: string; toolName?: string };
-				if (msg.role === "toolResult" && msg.toolName === "ada_checkpoint") {
-					checkpointAfterLastNudge = true;
-					break;
-				}
+				break;
 			}
 		}
 
 		return {
 			messages: messages.filter((m, i) => {
 				const msg = m as typeof m & { customType?: string };
-				if (msg.customType === "ada-nudge") return !checkpointAfterLastNudge && i === lastNudgeIdx;
+				if (msg.customType === "ada-nudge") return false;
 				if (msg.customType === "ada-context" && i !== lastContextIdx) return false;
 				return true;
 			}),
