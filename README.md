@@ -2,7 +2,7 @@
 
 A [Pi](https://github.com/mariozechner/pi) extension that gives AI agents a persistent, structured workspace for iterative work.
 
-When an agent is doing anything multi-step -- performance investigations, bug fixes, code reviews, planning sessions -- it creates an artifact: a living JSON document that serves as the source of truth for the entire task. The artifact survives across turns, sessions, and agent boundaries.
+When an agent is doing anything multi-step -- performance investigations, bug fixes, code reviews, planning sessions -- it uses an artifact: a living JSON document that serves as the source of truth for the entire task. The artifact survives across turns, sessions, and agent boundaries. New artifacts are created only when ADA is empty; resumed artifacts are treated as already active.
 
 ## Why
 
@@ -22,7 +22,7 @@ Artifacts live on disk at `~/.pi/agent/artifacts/{yyyymmdd}/{slug}/artifact.json
 
 ### Context Management
 
-ADA is designed to stay out of the way. The prompt injection is minimal: just the artifact title and ID (three lines). No data is loaded into context automatically. The agent controls what enters context by calling `ada_get` with specific keys. A massive artifact with 50 data keys does not bloat the context window.
+ADA is designed to stay out of the way. When an artifact is active or resumed, ADA injects that active artifact state so the model continues with `ada_get`, `ada_read`, `ada_update`, and `ada_checkpoint` instead of trying to create another artifact. No artifact data is loaded into context automatically. The agent controls what enters context by calling `ada_get` with specific keys. A massive artifact with 50 data keys does not bloat the context window.
 
 ### Session Binding
 
@@ -59,7 +59,7 @@ Pi loads extensions from `~/.pi/agent/extensions/` automatically. No configurati
 
 | Tool | Purpose |
 |------|---------|
-| `ada_create` | Start a new artifact with a title and type (investigation, fix, review, planning, build, general). One active artifact at a time. |
+| `ada_create` | Start a new artifact only when ADA is empty: no active artifact, no injected artifact, and no resumed artifact. |
 | `ada_update` | Write key-value pairs into the data object. Shallow merge -- existing keys overwritten, new keys added. |
 | `ada_get` | Targeted read. Pass specific keys to get just those, or no keys to get the header (available keys, checkpoints). Spawned agents pass an `id` to connect. |
 | `ada_read` | Full load. Returns everything. Use when resuming or when the complete picture is needed. Expensive on context. |
@@ -68,8 +68,8 @@ Pi loads extensions from `~/.pi/agent/extensions/` automatically. No configurati
 
 | Command | What it does |
 |---------|--------------|
-| `/ada-resume` | Interactive picker to resume another artifact |
-| `/ada-resume <id>` | Connect to a specific artifact by ID |
+| `/ada-resume` | Interactive picker to resume another artifact and make it active |
+| `/ada-resume <id>` | Connect to a specific artifact by ID and inject it as active state |
 | `/ada-inspect` | Open a visual artifact inspector in the browser (interactive picker if no artifact is active) |
 | `/ada-inspect <id>` | Inspect a specific artifact by ID |
 

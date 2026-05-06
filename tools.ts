@@ -6,7 +6,7 @@
  */
 
 import { StringEnum } from "@mariozechner/pi-ai";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import {
@@ -14,6 +14,30 @@ import {
 	acquireLock, releaseLock, findSimilarArtifacts, listArtifactsFromDisk,
 } from "./helpers.js";
 import type { ADAState, Artifact, ArtifactType, Checkpoint } from "./types.js";
+
+function restoreArtifactFromSession(ctx: ExtensionContext, state: ADAState): Artifact | null {
+	let artifactId: string | null = null;
+	for (const entry of ctx.sessionManager.getBranch()) {
+		if (entry.type === "custom" && entry.customType === "ada-artifact") {
+			const data = entry.data as { artifact?: { id: string } | null } | undefined;
+			artifactId = data?.artifact?.id ?? artifactId;
+		}
+		if (
+			entry.type === "message" &&
+			entry.message.role === "toolResult" &&
+			entry.message.toolName === "ada_create" &&
+			entry.message.details?.artifact
+		) {
+			const artifact = entry.message.details.artifact as Artifact;
+			artifactId = artifact.id;
+		}
+	}
+	if (!artifactId) return null;
+	const artifact = readArtifactFromDisk(artifactId);
+	if (!artifact) return null;
+	state.artifact = artifact;
+	return artifact;
+}
 
 export function registerTools(
 	pi: ExtensionAPI,
@@ -32,14 +56,14 @@ export function registerTools(
 		name: "ada_create",
 		label: "Create Artifact",
 		description:
-			"Create a new ADA artifact to track iterative work. Use when starting any multi-step task: " +
-			"performance investigations, bug fixes, code reviews, planning sessions, or any work that " +
-			"involves iteration. Only one artifact can be active at a time.",
-		promptSnippet: "Create an ADA artifact to track multi-step or iterative work",
+			"Create a new ADA artifact only when ADA state is empty: no active artifact, no injected artifact, " +
+			"and no resumed artifact for the current work. Use only for genuinely new multi-step work. " +
+			"If an artifact is already active or was selected with /ada-resume, do not call this tool.",
+		promptSnippet: "Create a new ADA artifact only when ADA state is empty",
 		promptGuidelines: [
-			"Create an artifact when work involves iteration, tracking, or multiple steps — performance investigations, bug fixes, code reviews, planning, anything non-trivial.",
-			"Always create an artifact before starting multi-step work. Update it as you go.",
-			"One artifact at a time. Creating a new one detaches the previous.",
+			"Use ada_create only when ADA state is empty: no active artifact, no injected artifact, and no resumed artifact.",
+			"If an artifact is active or /ada-resume was used, do not call ada_create. Continue with ada_get, ada_read, ada_update, or ada_checkpoint.",
+			"Before calling ada_create, check whether this work continues an existing artifact. If it does, use /ada-resume instead.",
 			"NEVER create a duplicate artifact. If one already exists for the same work, use /ada-resume to switch to it. The tool will block you if a similar artifact exists.",
 		],
 		parameters: Type.Object({
@@ -54,7 +78,7 @@ export function registerTools(
 			),
 		}),
 
-		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			// Hard guardrail: spawned agents must NEVER create artifacts.
 			if (isSpawnedAgent) {
 				return {
@@ -68,15 +92,16 @@ export function registerTools(
 				};
 			}
 
-			// Block if an artifact is already active. Use /ada-resume to switch.
-			if (state.artifact) {
+			const activeArtifact = state.artifact ?? restoreArtifactFromSession(ctx, state);
+			if (activeArtifact) {
 				return {
 					content: [{
 						type: "text" as const,
-						text: `An artifact is already active: "${state.artifact.title}" (${state.artifact.id}). ` +
-							`Use /ada-resume to switch artifacts. Do NOT try to close and recreate.`,
+						text: `BLOCKED: ADA state is not empty. Active artifact: "${activeArtifact.title}" (${activeArtifact.id}). ` +
+							`Do not call ada_create after an artifact is active, injected, or resumed. ` +
+							`Continue with ada_get, ada_read, ada_update, or ada_checkpoint. Use /ada-resume only to switch artifacts.`,
 					}],
-					details: {},
+					details: { blocked_reason: "active_artifact", existing_id: activeArtifact.id },
 				};
 			}
 
@@ -197,7 +222,7 @@ export function registerTools(
 		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
 			if (!state.artifact) {
 				return {
-					content: [{ type: "text" as const, text: "No active artifact. Create one with ada_create, or use ada_get with an artifact id to connect." }],
+					content: [{ type: "text" as const, text: "No active artifact. If ADA is empty and this is new iterative work, use ada_create. If an artifact already exists, use /ada-resume or ada_get with an artifact id." }],
 					details: {},
 				};
 			}
@@ -287,7 +312,7 @@ export function registerTools(
 		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
 			if (!state.artifact) {
 				return {
-					content: [{ type: "text" as const, text: "No active artifact. Use ada_get with an artifact id to connect, or ada_create to start a new one." }],
+					content: [{ type: "text" as const, text: "No active artifact. Use /ada-resume or ada_get with an artifact id to connect. Use ada_create only if ADA is empty and this is new iterative work." }],
 					details: {},
 				};
 			}
@@ -391,12 +416,13 @@ export function registerTools(
 					};
 				}
 				state.artifact = loaded;
+				persistState(pi, state);
 				justConnected = true;
 			}
 
 			if (!state.artifact) {
 				return {
-					content: [{ type: "text" as const, text: "No active artifact. Create one with ada_create, or pass an artifact id to connect." }],
+					content: [{ type: "text" as const, text: "No active artifact. Pass an artifact id, use /ada-resume, or use ada_create only if ADA is empty and this is new iterative work." }],
 					details: {},
 				};
 			}
@@ -522,7 +548,7 @@ export function registerTools(
 		async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
 			if (!state.artifact) {
 				return {
-					content: [{ type: "text" as const, text: "No active artifact. Use ada_get with an artifact id to connect, or ada_create to start a new one." }],
+					content: [{ type: "text" as const, text: "No active artifact. Use /ada-resume or ada_get with an artifact id to connect. Use ada_create only if ADA is empty and this is new iterative work." }],
 					details: {},
 				};
 			}

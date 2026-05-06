@@ -14,9 +14,11 @@ no lifecycle status, no closing. One artifact at a time. Use /ada-resume to swit
 
 ## When to create an artifact
 
-Any work that iterates: performance investigations, bug fixes, code reviews, planning
-sessions, peer reviews, research projects. If you will make more than 3 tool calls
-to get the job done, create an artifact.
+Any work that iterates can use an artifact: performance investigations, bug fixes,
+code reviews, planning sessions, peer reviews, research projects. Create one only
+when ADA is empty: no active artifact, no injected artifact, and no resumed artifact.
+If an artifact is active or /ada-resume was used, continue with that artifact instead
+of calling ada_create.
 
 ## Core concept
 
@@ -36,8 +38,9 @@ decisions made).
 
 ## Tools
 
-`ada_create` -- Start a new artifact. Only works when no artifact is currently active.
-If one exists, the tool blocks. Use /ada-resume to switch artifacts.
+`ada_create` -- Start a new artifact only when ADA state is empty. Empty means no
+active artifact, no injected artifact, and no artifact selected via /ada-resume. If
+one exists, the tool blocks. Use /ada-resume to switch artifacts.
 
 `ada_update` -- Write key-value pairs into data. Shallow merge at the top level.
 For nested updates, use `ada_get` to read the current value, modify it, then write
@@ -191,8 +194,9 @@ Bug investigation:
 Artifacts are shared across sessions. Any session can resume any artifact:
 
 1. Use `/ada-resume` to pick an artifact (interactive) or `/ada-resume {id}` for a specific one
-2. Call `ada_read` to load the full picture and orient
-3. From there, use `ada_get` for targeted reads as you work
+2. Treat the artifact as already active and do not call `ada_create`
+3. Call `ada_read` to load the full picture and orient
+4. From there, use `ada_get` for targeted reads as you work
 
 If an artifact is already active when you resume, the current one is detached and the
 new one becomes active. No closing needed.
@@ -287,6 +291,7 @@ your last checkpoint, you are overdue. Checkpoint what you learned before contin
 - Do not tell spawned agents to save to /tmp when an artifact is active. The artifact
   folder is the workspace.
 - Do not create a new artifact to amend an existing one. Update the original.
+- Do not call ada_create after /ada-resume. Resume means the artifact is already active.
 - Do not create "Issue 4691 Investigation" today and "Issue 4691 Investigation v2"
   tomorrow. Resume the original.
 - Do not add dates to artifact titles. "PR Review Triage" not "PR Review Triage - Apr 8".

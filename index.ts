@@ -74,15 +74,45 @@ export default function adaExtension(pi: ExtensionAPI): void {
 	};
 
 	let currentCtx: ExtensionContext | null = null;
+	let adaCreateSuppressedByAda = false;
+
+	function buildActiveArtifactContext(artifact: Artifact): string {
+		const dataKeys = Object.keys(artifact.data ?? {});
+		const keys = dataKeys.length > 0 ? dataKeys.join(", ") : "none";
+		return `ADA active artifact: "${artifact.title}" (${artifact.id}). ADA state is not empty. Do not call ada_create. Continue with ada_get, ada_read, ada_update, or ada_checkpoint. Use /ada-resume only if Leo asks to switch artifacts. Available data keys: ${keys}.`;
+	}
+
+	function syncAdaCreateToolAvailability(): void {
+		if (isSpawnedAgent) return;
+		const allTools = pi.getAllTools();
+		if (!allTools.some((tool) => tool.name === "ada_create")) return;
+		const activeTools = pi.getActiveTools();
+		const hasAdaCreate = activeTools.includes("ada_create");
+
+		if (state.artifact) {
+			if (hasAdaCreate) {
+				pi.setActiveTools(activeTools.filter((tool) => tool !== "ada_create"));
+				adaCreateSuppressedByAda = true;
+			}
+			return;
+		}
+
+		if (adaCreateSuppressedByAda && !hasAdaCreate) {
+			pi.setActiveTools([...activeTools, "ada_create"]);
+		}
+		adaCreateSuppressedByAda = false;
+	}
 
 	function refreshArtifactFromDisk(): Artifact | null {
 		if (!state.artifact) return null;
 		const fresh = readArtifactFromDisk(state.artifact.id);
 		if (!fresh) {
 			state.artifact = null;
+			syncAdaCreateToolAvailability();
 			return null;
 		}
 		state.artifact = fresh;
+		syncAdaCreateToolAvailability();
 		return fresh;
 	}
 
@@ -225,6 +255,7 @@ export default function adaExtension(pi: ExtensionAPI): void {
 
 		// Show or hide status bar based on restored state
 		updateBanner(ctx);
+		syncAdaCreateToolAvailability();
 	}
 
 	// ─── Session Events ─────────────────────────────────────────────
@@ -236,6 +267,29 @@ export default function adaExtension(pi: ExtensionAPI): void {
 
 	pi.on("agent_start", async (_event, ctx) => {
 		currentCtx = ctx;
+	});
+
+	pi.on("before_agent_start", async (event, ctx) => {
+		currentCtx = ctx;
+		const artifact = refreshArtifactFromDisk();
+		syncAdaCreateToolAvailability();
+		if (!artifact) return;
+		const content = buildActiveArtifactContext(artifact);
+		return {
+			message: {
+				customType: "ada-context",
+				content,
+				display: false,
+				details: {
+					artifact: {
+						id: artifact.id,
+						title: artifact.title,
+						type: artifact.type,
+					},
+				},
+			},
+			systemPrompt: `${event.systemPrompt}\n\n${content}`,
+		};
 	});
 
 	pi.on("input", async (event) => {
@@ -260,11 +314,13 @@ export default function adaExtension(pi: ExtensionAPI): void {
 		if (event.toolName === "ada_checkpoint") {
 			resetCheckpointDebt();
 			updateBanner();
+			syncAdaCreateToolAvailability();
 			return;
 		}
 
 		if (event.toolName === "ada_create" || event.toolName === "ada_update") {
 			updateBanner();
+			syncAdaCreateToolAvailability();
 			return;
 		}
 
@@ -426,6 +482,7 @@ export default function adaExtension(pi: ExtensionAPI): void {
 			const cpCount = (artifact.checkpoints ?? []).length;
 			ctx.ui.notify(`Resumed: "${artifact.title}" (${dataKeys.length} keys, ${cpCount} checkpoints)`, "info");
 			updateBanner(ctx);
+			syncAdaCreateToolAvailability();
 		},
 	});
 
@@ -566,6 +623,16 @@ export default function adaExtension(pi: ExtensionAPI): void {
 	// This is the explicit handoff — no guessing, no disk scanning.
 
 	pi.on("tool_call", async (event) => {
+		if (event.toolName === "ada_create") {
+			const artifact = refreshArtifactFromDisk();
+			syncAdaCreateToolAvailability();
+			if (!artifact) return;
+			return {
+				block: true,
+				reason: `BLOCKED: ADA already has an active artifact: "${artifact.title}" (${artifact.id}). ADA state is not empty, so ada_create is not allowed. Use ada_get, ada_read, ada_update, or ada_checkpoint. Use /ada-resume only to switch artifacts.`,
+			};
+		}
+
 		if (event.toolName !== "team_spawn") return;
 		if (!state.artifact) return;
 		if (isSpawnedAgent) return; // only leads inject
