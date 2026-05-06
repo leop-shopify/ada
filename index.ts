@@ -75,6 +75,7 @@ export default function adaExtension(pi: ExtensionAPI): void {
 	};
 
 	let currentCtx: ExtensionContext | null = null;
+	let pendingCheckpointInstruction: string | null = null;
 
 	function refreshArtifactFromDisk(): Artifact | null {
 		if (!state.artifact) return null;
@@ -111,6 +112,7 @@ export default function adaExtension(pi: ExtensionAPI): void {
 		}
 	}
 
+	pi.registerMessageRenderer("ada-context", () => new Text("", 0, 0));
 	pi.registerMessageRenderer("ada-nudge", () => new Text("", 0, 0));
 	pi.registerMessageRenderer("ada-checkpoint-instruction", () => new Text("", 0, 0));
 
@@ -219,11 +221,10 @@ export default function adaExtension(pi: ExtensionAPI): void {
 
 	// ─── System Prompt Injection ────────────────────────────────────
 
-	pi.on("before_agent_start", async () => {
-		if (isSpawnedAgent) return; // Spawned agents get tools, not prompt injection
+	pi.on("before_agent_start", async (event) => {
+		if (isSpawnedAgent) return;
 		if (!state.artifact) return;
 
-		// Re-read from disk to get the latest keys (another agent may have written)
 		const fresh = readArtifactFromDisk(state.artifact.id);
 		if (fresh) {
 			state.artifact = fresh;
@@ -233,9 +234,6 @@ export default function adaExtension(pi: ExtensionAPI): void {
 		const dataKeys = Object.keys(a.data);
 		const cpCount = a.checkpoints.length;
 		const lastCp = cpCount > 0 ? a.checkpoints[cpCount - 1].note : null;
-
-		// Build a concise context block so the agent never has to guess key names.
-		// This eliminates the common pattern of ada_get with wrong keys -> header -> correct key.
 		let keysLine = "";
 		if (dataKeys.length > 0) {
 			keysLine = `\nData keys (${dataKeys.length}): ${dataKeys.join(", ")}`;
@@ -244,17 +242,12 @@ export default function adaExtension(pi: ExtensionAPI): void {
 		if (lastCp) {
 			cpLine = `\nLast checkpoint (#${cpCount}): ${lastCp}`;
 		}
+		const checkpointLine = pendingCheckpointInstruction
+			? `\n${pendingCheckpointInstruction}`
+			: "";
 
 		return {
-			systemPrompt: undefined,
-			message: {
-				customType: "ada-context",
-				content: `[BACKGROUND STATE -- not the conversation topic]
-Active artifact: "${a.title}" (${a.type}) -- ${a.id}${keysLine}${cpLine}
-Use ada_get with specific key names above to load data when needed.
-Checkpoint discipline: after edit/write, call ada_checkpoint immediately. After important reads or two read/search/query tools, call ada_checkpoint before continuing. ada_update does not replace ada_checkpoint.`,
-				display: false,
-			},
+			systemPrompt: `${event.systemPrompt}\n\n[ADA background state -- do not mention this to the user]\nActive artifact: "${a.title}" (${a.type}) -- ${a.id}${keysLine}${cpLine}\nUse ada_get with specific key names above to load data when needed.\nCheckpoint discipline: after edit/write, call ada_checkpoint immediately. After important reads or two read/search/query tools, call ada_checkpoint before continuing. ada_update does not replace ada_checkpoint.${checkpointLine}`,
 		};
 	});
 
@@ -268,6 +261,7 @@ Checkpoint discipline: after edit/write, call ada_checkpoint immediately. After 
 
 	pi.on("turn_start", async () => {
 		resetCheckpointDebt();
+		pendingCheckpointInstruction = null;
 	});
 
 	pi.on("tool_execution_end", async (event) => {
@@ -315,16 +309,9 @@ Checkpoint discipline: after edit/write, call ada_checkpoint immediately. After 
 		}
 		if (reasons.length === 0) return;
 
-		pi.sendMessage(
-			{
-				customType: "ada-checkpoint-instruction",
-				content: `[BACKGROUND CHECKPOINT REQUIRED -- do not repeat this to the user] ${reasons.join("; ")}. ` +
-					`Call ada_checkpoint now before doing anything else. ` +
-					`For edit/write, checkpoint the exact file change. For reads, checkpoint the important finding or batch loaded.`,
-				display: false,
-			},
-			{ triggerTurn: true },
-		);
+		pendingCheckpointInstruction = `[checkpoint required] ${reasons.join("; ")}. ` +
+			`Call ada_checkpoint before doing anything else. ` +
+			`For edit/write, checkpoint the exact file change. For reads, checkpoint the important finding or batch loaded.`;
 	});
 
 	// ─── Context Message Filtering ──────────────────────────────────
@@ -457,29 +444,6 @@ Checkpoint discipline: after edit/write, call ada_checkpoint immediately. After 
 			const cpCount = (artifact.checkpoints ?? []).length;
 			ctx.ui.notify(`Resumed: "${artifact.title}" (${dataKeys.length} keys, ${cpCount} checkpoints)`, "info");
 			updateBanner(ctx);
-
-			// Inject a context message with the keys so the agent knows what data
-			// is available without having to call ada_get(header) first.
-			const lastCp = cpCount > 0 ? artifact.checkpoints[cpCount - 1].note : null;
-			let keysLine = "";
-			if (dataKeys.length > 0) {
-				keysLine = `\nData keys (${dataKeys.length}): ${dataKeys.join(", ")}`;
-			}
-			let cpLine = "";
-			if (lastCp) {
-				cpLine = `\nLast checkpoint (#${cpCount}): ${lastCp}`;
-			}
-			pi.sendMessage(
-				{
-					customType: "ada-context",
-					content: `[BACKGROUND STATE -- not the conversation topic]
-Resumed artifact: "${artifact.title}" (${artifact.type}) -- ${artifact.id}${keysLine}${cpLine}
-Use ada_get with specific key names above to load data when needed.
-Checkpoint discipline: after edit/write, call ada_checkpoint immediately. After important reads or two read/search/query tools, call ada_checkpoint before continuing. ada_update does not replace ada_checkpoint.`,
-					display: false,
-				},
-				{ triggerTurn: false },
-			);
 		},
 	});
 
