@@ -270,9 +270,15 @@ export function registerTools(
 		label: "Artifact Checkpoint",
 		description:
 			"Mark a checkpoint in the active artifact. Checkpoints are progress breadcrumbs " +
-			"that mark milestones -- not a journal. Use when reaching a meaningful point: " +
-			"a phase completed, a key measurement taken, a decision made that changes direction.",
-		promptSnippet: "Mark a progress checkpoint in the active artifact",
+			"that mark granular progress -- not a journal. Use immediately after edit/write, " +
+			"after every test run, after important read findings, or after a batch of information was loaded.",
+		promptSnippet: "Mark a granular checkpoint in the active artifact",
+		promptGuidelines: [
+			"Use ada_checkpoint immediately after every edit or write when an artifact is active.",
+			"Use ada_checkpoint after every test or verification run when an artifact is active.",
+			"Use ada_checkpoint after important read/search/query findings, or after two read-like tools have loaded new information.",
+			"Use ada_update for structured data and ada_checkpoint for progress. ada_update does not replace ada_checkpoint.",
+		],
 		parameters: Type.Object({
 			note: Type.String({ description: "What milestone was reached or what changed" }),
 		}),

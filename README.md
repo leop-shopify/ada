@@ -16,7 +16,7 @@ Each artifact has two parts:
 
 **data** -- a free-form JSON object the agent owns completely. Structure it however the work demands: nested objects, arrays, measurements, people, questions, files. The agent reads it, updates it, queries specific keys, and builds on it every iteration.
 
-**checkpoints** -- milestones that mark meaningful progress. Not a journal. Just the moments that matter: "baseline measured", "root cause found", "3/8 interviews complete".
+**checkpoints** -- granular progress markers. Not a journal. Every edit/write, every test run, every important read finding, and every loaded information batch gets its own breadcrumb.
 
 Artifacts live on disk at `~/.pi/agent/artifacts/{yyyymmdd}/{slug}/artifact.json`, organized by creation date. Each artifact gets its own folder where agents can also store reference files (evidence, drafts, exported data) alongside the main JSON. Legacy artifacts at the old flat path (`artifacts/{slug}/`) are read transparently for backward compatibility.
 
@@ -26,7 +26,7 @@ ADA is designed to stay out of the way. The prompt injection is minimal: just th
 
 ### Session Binding
 
-Artifacts belong to the session that created them. Different Pi sessions cannot auto-load each other's artifacts. The `/ada-resume` command is the explicit way to take ownership across sessions.
+Artifacts are shared across sessions. Different Pi sessions can resume the same artifact with `/ada-resume`, and spawned agents can connect with `ada_get` when given the artifact ID.
 
 ### Concurrent Access
 
@@ -63,7 +63,7 @@ Pi loads extensions from `~/.pi/agent/extensions/` automatically. No configurati
 | `ada_update` | Write key-value pairs into the data object. Shallow merge -- existing keys overwritten, new keys added. |
 | `ada_get` | Targeted read. Pass specific keys to get just those, or no keys to get the header (available keys, checkpoints). Spawned agents pass an `id` to connect. |
 | `ada_read` | Full load. Returns everything. Use when resuming or when the complete picture is needed. Expensive on context. |
-| `ada_checkpoint` | Mark a milestone. One sentence about what was reached. |
+| `ada_checkpoint` | Mark granular progress. Use immediately after edit/write, after every test run, after important read findings, and after loaded information batches. |
 ## Slash Commands
 
 | Command | What it does |
