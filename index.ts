@@ -34,18 +34,27 @@ import {
 import { registerTools } from "./tools.js";
 import type { ADAState, Artifact } from "./types.js";
 
-/** Tool names considered "substantive" for nudge heuristic. */
-const SUBSTANTIVE_TOOLS = new Set([
-	"bash", "read", "edit", "write",
+const MUTATING_TOOLS = new Set(["edit", "write"]);
+
+const READ_LIKE_TOOLS = new Set([
+	"read",
 	"grokt_search", "grokt_bulk_search", "grokt_get_file",
-	"observe_query", "observe_events_by_id", "observe_trace",
-	"data_portal_query_bigquery",
+	"observe_query", "observe_events_by_id", "observe_trace", "observe_error_groups", "observe_error_group",
+	"data_portal_search_data_platform", "data_portal_get_entry_metadata", "data_portal_query_bigquery", "data_portal_analyze_query_results",
+	"bk_build_info", "bk_failed_jobs", "bk_job_failure", "bk_job_logs",
+	"slack_search", "slack_thread", "slack_message", "slack_history", "slack_canvas",
+	"gmail_read", "gcal_events", "gcal_availability",
+	"gworkspace_read_file", "gdrive_search", "gsheets_read", "gdocs_get_structure",
+]);
+
+const OTHER_SUBSTANTIVE_TOOLS = new Set([
+	"bash",
 	"run_experiment",
 	"scan_test_gaps", "design_test_cases", "validate_test_value",
 ]);
 
-/** Minimum substantive tool calls before nudging. */
-const NUDGE_THRESHOLD = 2;
+const READ_BATCH_THRESHOLD = 2;
+const OTHER_SUBSTANTIVE_THRESHOLD = 2;
 
 const ADA_WIDGET_KEY = "ada-artifact-banner";
 
@@ -58,8 +67,9 @@ export default function adaExtension(pi: ExtensionAPI): void {
 
 	const state: ADAState = {
 		artifact: null,
-		artifactUpdatedThisTurn: false,
-		toolCallsThisTurn: 0,
+		mutatingToolsSinceCheckpoint: [],
+		readLikeToolsSinceCheckpoint: 0,
+		otherSubstantiveToolsSinceCheckpoint: 0,
 	};
 
 	let currentCtx: ExtensionContext | null = null;
@@ -107,8 +117,9 @@ export default function adaExtension(pi: ExtensionAPI): void {
 
 	function restoreState(ctx: ExtensionContext): void {
 		state.artifact = null;
-		state.artifactUpdatedThisTurn = false;
-		state.toolCallsThisTurn = 0;
+		state.mutatingToolsSinceCheckpoint = [];
+		state.readLikeToolsSinceCheckpoint = 0;
+		state.otherSubstantiveToolsSinceCheckpoint = 0;
 		currentCtx = ctx;
 
 		// Restore from session branch. Artifacts are shared — no session binding.
@@ -186,7 +197,8 @@ export default function adaExtension(pi: ExtensionAPI): void {
 				customType: "ada-context",
 				content: `[BACKGROUND STATE -- not the conversation topic]
 Active artifact: "${a.title}" (${a.type}) -- ${a.id}${keysLine}${cpLine}
-Use ada_get with specific key names above to load data when needed.`,
+Use ada_get with specific key names above to load data when needed.
+Checkpoint discipline: after edit/write, call ada_checkpoint immediately. After important reads or two read/search/query tools, call ada_checkpoint before continuing. ada_update does not replace ada_checkpoint.`,
 				display: false,
 			},
 		};
@@ -194,38 +206,69 @@ Use ada_get with specific key names above to load data when needed.`,
 
 	// ─── Nudge Tracking ─────────────────────────────────────────────
 
+	function resetCheckpointDebt(): void {
+		state.mutatingToolsSinceCheckpoint = [];
+		state.readLikeToolsSinceCheckpoint = 0;
+		state.otherSubstantiveToolsSinceCheckpoint = 0;
+	}
+
 	pi.on("turn_start", async () => {
-		state.artifactUpdatedThisTurn = false;
-		state.toolCallsThisTurn = 0;
+		resetCheckpointDebt();
 	});
 
 	pi.on("tool_execution_end", async (event) => {
-		if (
-			event.toolName === "ada_create" ||
-			event.toolName === "ada_update" ||
-			event.toolName === "ada_checkpoint"
-		) {
-			state.artifactUpdatedThisTurn = true;
+		if (event.toolName === "ada_checkpoint") {
+			resetCheckpointDebt();
 			updateBanner();
-		} else if (SUBSTANTIVE_TOOLS.has(event.toolName)) {
-			state.toolCallsThisTurn++;
+			return;
+		}
+
+		if (event.toolName === "ada_create" || event.toolName === "ada_update") {
+			updateBanner();
+			return;
+		}
+
+		if (!state.artifact) return;
+		if (event.isError && MUTATING_TOOLS.has(event.toolName)) return;
+
+		if (MUTATING_TOOLS.has(event.toolName)) {
+			state.mutatingToolsSinceCheckpoint.push(event.toolName);
+			return;
+		}
+
+		if (READ_LIKE_TOOLS.has(event.toolName)) {
+			state.readLikeToolsSinceCheckpoint++;
+			return;
+		}
+
+		if (OTHER_SUBSTANTIVE_TOOLS.has(event.toolName)) {
+			state.otherSubstantiveToolsSinceCheckpoint++;
 		}
 	});
 
-	pi.on("agent_end", async () => {
+	pi.on("turn_end", async () => {
 		if (!state.artifact) return;
-		if (state.artifactUpdatedThisTurn) return;
-		if (state.toolCallsThisTurn < NUDGE_THRESHOLD) return;
 
-		const severity = state.toolCallsThisTurn >= 4 ? "OVERDUE" : "REMINDER";
+		const reasons: string[] = [];
+		if (state.mutatingToolsSinceCheckpoint.length > 0) {
+			reasons.push(`edit/write tools ran: ${state.mutatingToolsSinceCheckpoint.join(", ")}`);
+		}
+		if (state.readLikeToolsSinceCheckpoint >= READ_BATCH_THRESHOLD) {
+			reasons.push(`${state.readLikeToolsSinceCheckpoint} read/search/query tools loaded information`);
+		}
+		if (state.otherSubstantiveToolsSinceCheckpoint >= OTHER_SUBSTANTIVE_THRESHOLD) {
+			reasons.push(`${state.otherSubstantiveToolsSinceCheckpoint} substantive tools ran`);
+		}
+		if (reasons.length === 0) return;
+
 		pi.sendMessage(
 			{
 				customType: "ada-nudge",
-				content: `[${severity}] You made ${state.toolCallsThisTurn} substantive tool calls this turn without a checkpoint or update. ` +
-					`Checkpoint what you found before continuing. One discovery, one checkpoint.`,
+				content: `[CHECKPOINT REQUIRED] ${reasons.join("; ")}. Call ada_checkpoint now before doing anything else. ` +
+					`For edit/write, checkpoint the exact file change. For reads, checkpoint the important finding or batch loaded.`,
 				display: true,
 			},
-			{ triggerTurn: false },
+			{ triggerTurn: true },
 		);
 	});
 
@@ -233,20 +276,35 @@ Use ada_get with specific key names above to load data when needed.`,
 
 	pi.on("context", async (event) => {
 		let lastContextIdx = -1;
+		let lastNudgeIdx = -1;
+		let checkpointAfterLastNudge = false;
 		const messages = event.messages;
 
 		for (let i = messages.length - 1; i >= 0; i--) {
-			const msg = messages[i] as typeof messages[number] & { customType?: string };
-			if (msg.customType === "ada-context") {
+			const msg = messages[i] as typeof messages[number] & { customType?: string; role?: string; toolName?: string };
+			if (lastContextIdx === -1 && msg.customType === "ada-context") {
 				lastContextIdx = i;
-				break;
+			}
+			if (lastNudgeIdx === -1 && msg.customType === "ada-nudge") {
+				lastNudgeIdx = i;
+			}
+			if (lastContextIdx !== -1 && lastNudgeIdx !== -1) break;
+		}
+
+		if (lastNudgeIdx !== -1) {
+			for (let i = lastNudgeIdx + 1; i < messages.length; i++) {
+				const msg = messages[i] as typeof messages[number] & { role?: string; toolName?: string };
+				if (msg.role === "toolResult" && msg.toolName === "ada_checkpoint") {
+					checkpointAfterLastNudge = true;
+					break;
+				}
 			}
 		}
 
 		return {
 			messages: messages.filter((m, i) => {
 				const msg = m as typeof m & { customType?: string };
-				if (msg.customType === "ada-nudge") return false;
+				if (msg.customType === "ada-nudge") return !checkpointAfterLastNudge && i === lastNudgeIdx;
 				if (msg.customType === "ada-context" && i !== lastContextIdx) return false;
 				return true;
 			}),
@@ -376,7 +434,8 @@ Use ada_get with specific key names above to load data when needed.`,
 					customType: "ada-context",
 					content: `[BACKGROUND STATE -- not the conversation topic]
 Resumed artifact: "${artifact.title}" (${artifact.type}) -- ${artifact.id}${keysLine}${cpLine}
-Use ada_get with specific key names above to load data when needed.`,
+Use ada_get with specific key names above to load data when needed.
+Checkpoint discipline: after edit/write, call ada_checkpoint immediately. After important reads or two read/search/query tools, call ada_checkpoint before continuing. ada_update does not replace ada_checkpoint.`,
 					display: false,
 				},
 				{ triggerTurn: false },
@@ -540,8 +599,9 @@ Use ada_get with specific key names above to load data when needed.`,
 			keysInfo +
 			`\n\nCHECKPOINT DISCIPLINE (mandatory):\n` +
 			`Checkpoint after EVERY meaningful step. Never batch.\n` +
-			`For code changes: one edit, one test run, one checkpoint.\n` +
-			`For research: one search+discovery, one checkpoint. If you called 2+ tools since your last checkpoint, you are overdue.\n` +
+			`For code changes: every edit or write gets an immediate checkpoint, even before tests. Each test run gets its own checkpoint too.\n` +
+			`For reads: checkpoint any important data immediately. If you loaded information with 2+ read/search/query tools, checkpoint the batch before continuing.\n` +
+			`ada_update does not replace ada_checkpoint. Use both when you stored structured data and also reached a progress point.\n` +
 			`Each checkpoint says what you found or changed, not the overall status. Granular, not summary.`;
 	});
 

@@ -28,10 +28,11 @@ This is the substance. You read it, update it, query specific keys, and build on
 every iteration.
 
 **checkpoints** -- granular progress markers that track every meaningful change.
-For fix, build, and investigation work: one change, one test run, one checkpoint.
-Never batch multiple changes into a single checkpoint. The trail must show what
-each individual change did in isolation. For planning and review work, checkpoints
-can be coarser (phase transitions, decisions made).
+For fix, build, and investigation work: every edit/write gets an immediate checkpoint,
+and every test run gets its own checkpoint. Never batch multiple changes into a
+single checkpoint. The trail must show what each individual change did in isolation.
+For planning and review work, checkpoints can be coarser (phase transitions,
+decisions made).
 
 ## Tools
 
@@ -51,8 +52,9 @@ parameter to connect to an artifact they were told about by the lead.
 or when you genuinely need the complete picture. Expensive on context.
 
 `ada_checkpoint` -- Mark progress. One sentence about what was reached or changed.
-For iterative work (fixes, builds, investigations): checkpoint after every change
-and every test run. This is non-negotiable.
+For iterative work (fixes, builds, investigations): checkpoint immediately after
+every edit/write, after every test run, after important read findings, and after
+batches of loaded information. This is non-negotiable.
 
 There is no ada_close. Artifacts do not close. To switch, use /ada-resume.
 
@@ -231,14 +233,17 @@ gets its own checkpoint. This applies to ALL artifact types and ALL agents.
 
 ### For fix and build work:
 
-1. Make a change (edit a file, apply a fix, modify config)
-2. Run the test or verification
-3. Checkpoint with: what you changed, the test result, what changed from the previous run
-4. If the test fails: note the new error before moving to the next change
+1. Make a change (edit a file, write a file, apply a fix, modify config)
+2. Checkpoint the exact change immediately
+3. Run the test or verification
+4. Checkpoint the test result and what changed from the previous run
+5. If the test fails: note the new error before moving to the next change
 
-Good: "Fix 1: changed nav selector from locator('nav').first() to
-getByRole('navigation', {name: /settings menu/i}). Test run: 6 more subpages pass,
-new failure at Gift cards link."
+Good: "Changed nav selector from locator('nav').first() to
+getByRole('navigation', {name: /settings menu/i}) in settings navigation test."
+
+Good: "Test run after nav selector change: 6 more subpages pass, new failure at
+Gift cards link."
 
 Bad: "Applied fixes 1, 2, and 3. Tests pass now."
 

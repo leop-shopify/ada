@@ -58,10 +58,9 @@ export interface Artifact {
 export interface ADAState {
 	/** The currently active artifact, or null. */
 	artifact: Artifact | null;
-	/** Whether any artifact tool was called this turn (for nudge tracking). */
-	artifactUpdatedThisTurn: boolean;
-	/** Count of substantive tool calls this turn (for nudge heuristic). */
-	toolCallsThisTurn: number;
+	mutatingToolsSinceCheckpoint: string[];
+	readLikeToolsSinceCheckpoint: number;
+	otherSubstantiveToolsSinceCheckpoint: number;
 
 }
 
