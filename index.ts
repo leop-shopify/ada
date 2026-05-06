@@ -34,7 +34,7 @@ import {
 	timeSince as timeSinceDate,
 } from "./helpers.js";
 import { registerTools } from "./tools.js";
-import type { ADAState, Artifact, ArtifactInput } from "./types.js";
+import type { ADAState, Artifact, ArtifactInput, Checkpoint } from "./types.js";
 
 const MUTATING_TOOLS = new Set(["edit", "write"]);
 
@@ -75,7 +75,6 @@ export default function adaExtension(pi: ExtensionAPI): void {
 	};
 
 	let currentCtx: ExtensionContext | null = null;
-	let pendingCheckpointInstruction: string | null = null;
 
 	function refreshArtifactFromDisk(): Artifact | null {
 		if (!state.artifact) return null;
@@ -110,6 +109,37 @@ export default function adaExtension(pi: ExtensionAPI): void {
 		} finally {
 			releaseLock(artifactId);
 		}
+	}
+
+	async function appendCheckpoint(note: string): Promise<void> {
+		if (!state.artifact) return;
+		const artifactId = state.artifact.id;
+		await acquireLock(artifactId);
+		try {
+			const fresh = readArtifactFromDisk(artifactId);
+			if (!fresh) return;
+			const checkpoint: Checkpoint = {
+				timestamp: new Date().toISOString(),
+				note,
+			};
+			fresh.checkpoints = [...(fresh.checkpoints ?? []), checkpoint];
+			fresh.updated_at = new Date().toISOString();
+			writeArtifactToDisk(fresh);
+			state.artifact = fresh;
+			persistState(pi, state);
+		} finally {
+			releaseLock(artifactId);
+		}
+		updateBanner();
+	}
+
+	function toolTarget(event: { args?: unknown; input?: unknown }): string | null {
+		const args = (event.args ?? event.input) as Record<string, unknown> | undefined;
+		if (!args) return null;
+		if (typeof args.path === "string") return args.path;
+		if (typeof args.file_path === "string") return args.file_path;
+		if (typeof args.production_file === "string") return args.production_file;
+		return null;
 	}
 
 	pi.registerMessageRenderer("ada-context", () => new Text("", 0, 0));
@@ -219,38 +249,6 @@ export default function adaExtension(pi: ExtensionAPI): void {
 		updateBanner();
 	});
 
-	// ─── System Prompt Injection ────────────────────────────────────
-
-	pi.on("before_agent_start", async (event) => {
-		if (isSpawnedAgent) return;
-		if (!state.artifact) return;
-
-		const fresh = readArtifactFromDisk(state.artifact.id);
-		if (fresh) {
-			state.artifact = fresh;
-		}
-
-		const a = state.artifact;
-		const dataKeys = Object.keys(a.data);
-		const cpCount = a.checkpoints.length;
-		const lastCp = cpCount > 0 ? a.checkpoints[cpCount - 1].note : null;
-		let keysLine = "";
-		if (dataKeys.length > 0) {
-			keysLine = `\nData keys (${dataKeys.length}): ${dataKeys.join(", ")}`;
-		}
-		let cpLine = "";
-		if (lastCp) {
-			cpLine = `\nLast checkpoint (#${cpCount}): ${lastCp}`;
-		}
-		const checkpointLine = pendingCheckpointInstruction
-			? `\n${pendingCheckpointInstruction}`
-			: "";
-
-		return {
-			systemPrompt: `${event.systemPrompt}\n\n[ADA background state -- do not mention this to the user]\nActive artifact: "${a.title}" (${a.type}) -- ${a.id}${keysLine}${cpLine}\nUse ada_get with specific key names above to load data when needed.\nCheckpoint discipline: after edit/write, call ada_checkpoint immediately. After important reads or two read/search/query tools, call ada_checkpoint before continuing. ada_update does not replace ada_checkpoint.${checkpointLine}`,
-		};
-	});
-
 	// ─── Nudge Tracking ─────────────────────────────────────────────
 
 	function resetCheckpointDebt(): void {
@@ -261,7 +259,6 @@ export default function adaExtension(pi: ExtensionAPI): void {
 
 	pi.on("turn_start", async () => {
 		resetCheckpointDebt();
-		pendingCheckpointInstruction = null;
 	});
 
 	pi.on("tool_execution_end", async (event) => {
@@ -280,38 +277,28 @@ export default function adaExtension(pi: ExtensionAPI): void {
 		if (event.isError && MUTATING_TOOLS.has(event.toolName)) return;
 
 		if (MUTATING_TOOLS.has(event.toolName)) {
-			state.mutatingToolsSinceCheckpoint.push(event.toolName);
+			const target = toolTarget(event);
+			await appendCheckpoint(target ? `${event.toolName} changed ${target}` : `${event.toolName} changed files`);
+			resetCheckpointDebt();
 			return;
 		}
 
 		if (READ_LIKE_TOOLS.has(event.toolName)) {
 			state.readLikeToolsSinceCheckpoint++;
+			if (state.readLikeToolsSinceCheckpoint >= READ_BATCH_THRESHOLD) {
+				await appendCheckpoint(`${state.readLikeToolsSinceCheckpoint} read/search/query tools loaded information`);
+				state.readLikeToolsSinceCheckpoint = 0;
+			}
 			return;
 		}
 
 		if (OTHER_SUBSTANTIVE_TOOLS.has(event.toolName)) {
 			state.otherSubstantiveToolsSinceCheckpoint++;
+			if (state.otherSubstantiveToolsSinceCheckpoint >= OTHER_SUBSTANTIVE_THRESHOLD) {
+				await appendCheckpoint(`${state.otherSubstantiveToolsSinceCheckpoint} substantive tools ran`);
+				state.otherSubstantiveToolsSinceCheckpoint = 0;
+			}
 		}
-	});
-
-	pi.on("turn_end", async () => {
-		if (!state.artifact) return;
-
-		const reasons: string[] = [];
-		if (state.mutatingToolsSinceCheckpoint.length > 0) {
-			reasons.push(`edit/write tools ran: ${state.mutatingToolsSinceCheckpoint.join(", ")}`);
-		}
-		if (state.readLikeToolsSinceCheckpoint >= READ_BATCH_THRESHOLD) {
-			reasons.push(`${state.readLikeToolsSinceCheckpoint} read/search/query tools loaded information`);
-		}
-		if (state.otherSubstantiveToolsSinceCheckpoint >= OTHER_SUBSTANTIVE_THRESHOLD) {
-			reasons.push(`${state.otherSubstantiveToolsSinceCheckpoint} substantive tools ran`);
-		}
-		if (reasons.length === 0) return;
-
-		pendingCheckpointInstruction = `[checkpoint required] ${reasons.join("; ")}. ` +
-			`Call ada_checkpoint before doing anything else. ` +
-			`For edit/write, checkpoint the exact file change. For reads, checkpoint the important finding or batch loaded.`;
 	});
 
 	// ─── Context Message Filtering ──────────────────────────────────
